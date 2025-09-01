@@ -10,6 +10,15 @@
 - Install: `pip install .` and `pip install .[dev]` (or `poetry install`).
 - Run (single GPU): `python generate.py --task t2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-T2V-A14B --prompt "..."`.
 - Run (multi‑GPU): `torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B --dit_fsdp --t5_fsdp --ulysses_size 8`.
+  - TeaCache (I2V/TI2V only): add `--teacache --teacache_thresh 0.08` to enable conditional transformer skipping for speedups (~1.3–2.0x depending on threshold). Example:
+    - Single GPU TI2V: `python generate.py --task ti2v-5B --size 1280*704 --ckpt_dir ./Wan2.2-TI2V-5B --teacache --teacache_thresh 0.08`
+    - Multi-GPU I2V: `torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B --dit_fsdp --t5_fsdp --ulysses_size 8 --teacache --teacache_thresh 0.08`
+  - TeaCache flags:
+    - `--teacache`: enable (disabled by default)
+    - `--teacache_thresh`: skip aggressiveness (default 0.08)
+    - `--teacache_policy`: rescale policy (`linear` default)
+    - `--teacache_warmup`: force compute first K steps (default 1)
+    - `--teacache_last_steps`: force compute last K steps (default 1)
 - Tests (E2E): `bash tests/test.sh <local model dir> <gpu number>`.
 - Format: `make format` (isort + yapf) or `black . && isort .`.
 
@@ -31,4 +40,3 @@
 ## Security & Configuration Tips
 - Do not commit model weights or personal tokens. Use env vars for APIs: `DASH_API_KEY` (and `DASH_API_URL` for intl). Add secrets via your shell, not code.
 - Large runs may require ≥80GB VRAM (single GPU); prefer FSDP + Ulysses for multi‑GPU.
-

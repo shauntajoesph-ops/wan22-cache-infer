@@ -64,6 +64,13 @@ def _validate_args(args):
         assert args.image is not None, "Please specify the image path for i2v."
 
     cfg = WAN_CONFIGS[args.task]
+    # Propagate TeaCache flags via config for pipelines to consume (minimal surface change).
+    # Pipelines read these attributes to attach per-model TeaCache state when timesteps are known.
+    cfg.teacache = args.teacache
+    cfg.teacache_thresh = args.teacache_thresh
+    cfg.teacache_policy = args.teacache_policy
+    cfg.teacache_warmup = args.teacache_warmup
+    cfg.teacache_last_steps = args.teacache_last_steps
 
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
@@ -200,6 +207,37 @@ def _parse_args():
         type=float,
         default=None,
         help="Classifier free guidance scale.")
+    # TeaCache flags (Phase 1: I2V & TI2V only)
+    parser.add_argument(
+        "--teacache",
+        action="store_true",
+        default=False,
+        help="Enable TeaCache-style conditional transformer skipping (I2V/TI2V only)."
+    )
+    parser.add_argument(
+        "--teacache_thresh",
+        type=float,
+        default=0.08,
+        help="TeaCache accumulator threshold; higher values skip more but may degrade quality."
+    )
+    parser.add_argument(
+        "--teacache_policy",
+        type=str,
+        default="linear",
+        help="TeaCache rescale policy (default: 'linear')."
+    )
+    parser.add_argument(
+        "--teacache_warmup",
+        type=int,
+        default=1,
+        help="Number of initial steps to force compute."
+    )
+    parser.add_argument(
+        "--teacache_last_steps",
+        type=int,
+        default=1,
+        help="Number of final steps to force compute."
+    )
     parser.add_argument(
         "--convert_model_dtype",
         action="store_true",

@@ -5,6 +5,7 @@ import torch.cuda.amp as amp
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
+from ..utils.teacache import summarize_mod, rescale
 
 
 def pad_freqs(original_tensor, target_len):
@@ -131,8 +132,82 @@ def sp_dit_forward(
         context=context,
         context_lens=context_lens)
 
-    for block in self.blocks:
-        x = block(x, **kwargs)
+    # TeaCache gate for SP: compute first-block modulated input and decide skip/compute consistently across ranks.
+    use_teacache = bool(getattr(self, "enable_teacache", False)) and getattr(
+        self, "teacache", None) is not None
+
+    if not use_teacache:
+        # Baseline compute path (unchanged)
+        for block in self.blocks:
+            x = block(x, **kwargs)
+    else:
+        block0 = self.blocks[0]
+        norm_x = block0.norm1(x).float()
+        with amp.autocast(dtype=torch.float32):
+            e_chunks = (block0.modulation.unsqueeze(0) + kwargs["e"]).chunk(
+                6, dim=2)
+        mod_inp = norm_x * (1 + e_chunks[1].squeeze(2)) + e_chunks[0].squeeze(2)
+
+        state = getattr(self, "teacache")  # type: ignore[attr-defined]
+        branch_state = state.branch_state()
+
+        # Lifecycle guards
+        force_compute = False
+        if branch_state.prev_mod_sig is None:
+            force_compute = True
+        if state.branch == 'cond':
+            if state.cnt < state.warmup:
+                force_compute = True
+            if state.cnt >= max(0, state.num_steps - state.last_steps):
+                force_compute = True
+
+        skip = False
+        cur_sig = summarize_mod(mod_inp)
+        if not force_compute and branch_state.prev_mod_sig is not None:
+            prev = branch_state.prev_mod_sig
+            import math
+            rel = abs(cur_sig - prev) / (abs(prev) + 1e-8)
+            # AllReduce mean across SP ranks for a unified decision
+            rel_t = torch.tensor([rel], device=norm_x.device, dtype=torch.float32)
+            import torch.distributed as dist
+            dist.all_reduce(rel_t, op=dist.ReduceOp.SUM)
+            world = get_world_size()
+            rel = float(rel_t.item() / max(1, int(world)))
+            rel_rescaled = rescale(rel, state.policy)
+            if not (math.isfinite(rel) and math.isfinite(rel_rescaled)):
+                state.failsafe_count += 1
+                force_compute = True
+            if not force_compute:
+                branch_state.accum += float(rel_rescaled)
+                # Telemetry
+                branch_state.sum_rel += float(rel)
+                branch_state.sum_rescaled += float(rel_rescaled)
+                branch_state.count_rel += 1
+                skip = branch_state.accum < float(state.thresh)
+
+        if skip and (branch_state.prev_residual is not None):
+            # Residual is already sequence-sharded; ensure shape match
+            if (branch_state.shape is not None and x.shape == tuple(
+                    branch_state.shape)):
+                x = x + branch_state.prev_residual.to(x.device, x.dtype)
+                branch_state.skipped += 1
+            else:
+                x_before = x
+                for block in self.blocks:
+                    x = block(x, **kwargs)
+                branch_state.prev_residual = (x - x_before).detach().to(x.dtype)
+                branch_state.shape = tuple(branch_state.prev_residual.shape)
+                branch_state.accum = 0.0
+        else:
+            x_before = x
+            for block in self.blocks:
+                x = block(x, **kwargs)
+            branch_state.prev_residual = (x - x_before).detach().to(x.dtype)
+            branch_state.shape = tuple(branch_state.prev_residual.shape)
+            branch_state.accum = 0.0
+
+        branch_state.prev_mod_sig = float(cur_sig)
+        branch_state.total += 1
 
     # head
     x = self.head(x, e)

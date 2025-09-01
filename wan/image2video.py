@@ -23,6 +23,7 @@ from .distributed.util import get_world_size
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
+from .utils.teacache import TeaCacheState
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -134,6 +135,83 @@ class WanI2V:
             self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
+        # TeaCache: will be attached per-model after sampling_steps is known.
+        self._teacache_cfg = None  # type: ignore
+
+    def _attach_teacache_state(self, timesteps_len: int):
+        """
+        Attach TeaCache state to both expert models (low/high noise).
+
+        Args:
+            timesteps_len: Number of denoising steps for this run.
+        """
+        if getattr(self, "_teacache_cfg", None) is not None:
+            return
+        self._teacache_cfg = dict(
+            enabled=getattr(self.config, "teacache", False),
+            num_steps=timesteps_len,
+            thresh=getattr(self.config, "teacache_thresh", 0.08),
+            policy=getattr(self.config, "teacache_policy", "linear"),
+            warmup=getattr(self.config, "teacache_warmup", 1),
+            last_steps=getattr(self.config, "teacache_last_steps", 1),
+        )
+        for m in (self.low_noise_model, self.high_noise_model):
+            # Attach on wrapper
+            m.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+            m.teacache = TeaCacheState(
+                enabled=bool(self._teacache_cfg["enabled"]),
+                num_steps=int(self._teacache_cfg["num_steps"]),
+                thresh=float(self._teacache_cfg["thresh"]),
+                policy=str(self._teacache_cfg["policy"]),
+                warmup=int(self._teacache_cfg["warmup"]),
+                last_steps=int(self._teacache_cfg["last_steps"]),
+                sp_world_size=get_world_size(),
+            )  # type: ignore[attr-defined]
+            # Attach on inner module if FSDP-wrapped
+            inner = getattr(m, "module", None)
+            if inner is not None:
+                inner.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+                inner.teacache = TeaCacheState(
+                    enabled=bool(self._teacache_cfg["enabled"]),
+                    num_steps=int(self._teacache_cfg["num_steps"]),
+                    thresh=float(self._teacache_cfg["thresh"]),
+                    policy=str(self._teacache_cfg["policy"]),
+                    warmup=int(self._teacache_cfg["warmup"]),
+                    last_steps=int(self._teacache_cfg["last_steps"]),
+                    sp_world_size=get_world_size(),
+                )  # type: ignore[attr-defined]
+
+    def _move_teacache_residual_to_cpu(self, model):
+        """If TeaCache is attached, move cached residuals to CPU to free VRAM.
+
+        Called when a model is offloaded to CPU; since residual is not a parameter,
+        `.to('cpu')` on the module will not move it automatically.
+        """
+        target = getattr(model, "module", model)
+        st = getattr(target, "teacache", None)
+        if not st:
+            return
+        for br in (st.cond, st.uncond):
+            if br.prev_residual is not None and br.prev_residual.device.type == 'cuda':
+                br.prev_residual = br.prev_residual.to('cpu')
+
+    def _log_teacache_stats(self):
+        """Log end-of-run TeaCache telemetry for both experts (rank 0 only)."""
+        for name, m in (("low", self.low_noise_model), ("high", self.high_noise_model)):
+            target = getattr(m, "module", m)
+            st = getattr(target, "teacache", None)
+            if not st or not getattr(target, "enable_teacache", False):
+                continue
+            c = st.cond
+            u = st.uncond
+            def rate(sk, tot):
+                return (100.0 * sk / tot) if tot else 0.0
+            logging.info(
+                f"TeaCache[{name}] skips: cond {c.skipped}/{c.total} ({rate(c.skipped,c.total):.1f}%), "
+                f"uncond {u.skipped}/{u.total} ({rate(u.skipped,u.total):.1f}%), "
+                f"avg rel {((c.sum_rel+u.sum_rel)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+                f"avg rescaled {((c.sum_rescaled+u.sum_rescaled)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+                f"failsafe {st.failsafe_count}")
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -208,13 +286,12 @@ class WanI2V:
             offload_model_name = 'high_noise_model'
         # OPTIM: CPU offload of inactive expert; bring active expert on-demand.
         if offload_model or self.init_on_cpu:
-            if next(getattr(
-                    self,
-                    offload_model_name).parameters()).device.type == 'cuda':
+            # If offloading the inactive expert, also move its cached residuals to CPU.
+            if next(getattr(self, offload_model_name).parameters()).device.type == 'cuda':
                 getattr(self, offload_model_name).to('cpu')
-            if next(getattr(
-                    self,
-                    required_model_name).parameters()).device.type == 'cpu':
+                self._move_teacache_residual_to_cpu(getattr(self, offload_model_name))
+            # Bring the required expert to GPU if needed (residual moved on demand in forward).
+            if next(getattr(self, required_model_name).parameters()).device.type == 'cpu':
                 getattr(self, required_model_name).to(self.device)
         return getattr(self, required_model_name)
 
@@ -397,6 +474,9 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
+            # Attach TeaCache state to experts after timesteps are known. We do this once per run.
+            self._attach_teacache_state(len(timesteps))
+
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
@@ -408,10 +488,19 @@ class WanI2V:
                 sample_guide_scale = guide_scale[1] if t.item(
                 ) >= boundary else guide_scale[0]
 
+                # TeaCache: set branch to 'cond' and increment cnt once per step on cond.
+                if getattr(model, "enable_teacache", False):  # type: ignore[attr-defined]
+                    model.teacache.branch = 'cond'  # type: ignore[attr-defined]
+                    # Increase step counter on cond only.
+                    model.teacache.cnt += 1  # type: ignore[attr-defined]
+
                 noise_pred_cond = model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
+                # TeaCache: switch to 'uncond' branch for the second evaluation.
+                if getattr(model, "enable_teacache", False):  # type: ignore[attr-defined]
+                    model.teacache.branch = 'uncond'  # type: ignore[attr-defined]
                 noise_pred_uncond = model(
                     latent_model_input, t=timestep, **arg_null)[0]
                 if offload_model:
@@ -446,4 +535,7 @@ class WanI2V:
         if dist.is_initialized():
             dist.barrier()
 
+        # Emit TeaCache telemetry on rank 0 if enabled.
+        if self.rank == 0:
+            self._log_teacache_stats()
         return videos[0] if self.rank == 0 else None

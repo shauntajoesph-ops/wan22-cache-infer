@@ -409,6 +409,12 @@ class WanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
+        # TeaCache integration (Phase 1):
+        # - Disabled by default; pipelines attach a `TeaCacheState` and flip this flag.
+        # - We avoid importing here to keep model portable without the feature.
+        self.enable_teacache = False  # type: ignore[attr-defined]
+        self.teacache = None  # type: ignore[attr-defined]
+
     def forward(
         self,
         x,
@@ -488,8 +494,118 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens)
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        # TeaCache gate: conditionally skip the block stack by reusing a cached residual.
+        # The gating signal is derived from block0's norm-and-modulate input.
+        # This block is guarded and has no effect unless `enable_teacache` is True and a state is set.
+        use_teacache = bool(getattr(self, "enable_teacache", False)) and getattr(
+            self, "teacache", None) is not None
+
+        if not use_teacache:
+            # Baseline path (unchanged): compute all blocks.
+            for block in self.blocks:
+                x = block(x, **kwargs)
+        else:
+            # Compute first-block modulated input as in WanAttentionBlock.forward
+            block0 = self.blocks[0]
+            # norm1(x) in fp32 for numerical stability
+            norm_x = block0.norm1(x).float()  # [B, L, C]
+            # time modulation chunks: (bias, scale, gate) groupings taken from design (6 parts)
+            with torch.amp.autocast('cuda', dtype=torch.float32):
+                e_chunks = (block0.modulation.unsqueeze(0) + kwargs["e"]).chunk(
+                    6, dim=2)
+            # modulated input used by the first self-attention (pre-attn resid)
+            mod_inp = norm_x * (1 + e_chunks[1].squeeze(2)) + e_chunks[0].squeeze(2)
+
+            # Import locally to avoid circular deps at import time
+            from ..utils.teacache import summarize_mod, rescale, move_residual_to
+
+            state = getattr(self, "teacache")  # type: ignore[attr-defined]
+            assert state is not None
+            # Select per-branch state: cond/uncond
+            branch_state = state.branch_state()
+
+            # Determine if we should force compute due to lifecycle rules
+            force_compute = False
+            # First use: no previous signature
+            if branch_state.prev_mod_sig is None:
+                force_compute = True
+            # Warmup / last steps: always compute
+            if state.branch == 'cond':
+                # Only cond branch increments cnt externally; here we read it.
+                if state.cnt < state.warmup:
+                    force_compute = True
+                if state.cnt >= max(0, state.num_steps - state.last_steps):
+                    force_compute = True
+
+            # Compute relative change if possible
+            skip = False
+            cur_sig = summarize_mod(mod_inp)
+            if not force_compute and branch_state.prev_mod_sig is not None:
+                prev = branch_state.prev_mod_sig
+                # Relative L1 (scalar) with epsilon to avoid div-by-zero
+                import math
+                rel = abs(cur_sig - prev) / (abs(prev) + 1e-8)
+                # Sequence parallel synchronization: if using SP, all ranks must agree on the scalar
+                if hasattr(self, "sp_size") and getattr(self, "sp_size") > 1:
+                    import torch.distributed as dist
+                    # Convert to tensor on the correct device for reduction
+                    rel_t = torch.tensor([rel], device=norm_x.device, dtype=torch.float32)
+                    # AllReduce SUM, then divide by world size for mean
+                    dist.all_reduce(rel_t, op=dist.ReduceOp.SUM)
+                    world = getattr(self, "sp_size")
+                    rel = float(rel_t.item() / max(1, int(world)))
+                # Rescale according to policy (identity for 'linear')
+                rel_rescaled = rescale(rel, state.policy)
+                # Fail-safe: invalid numbers cause a forced compute and reset.
+                if not (math.isfinite(rel) and math.isfinite(rel_rescaled)):
+                    state.failsafe_count += 1  # type: ignore[attr-defined]
+                    force_compute = True
+                # Accumulate and decide
+                if not force_compute:
+                    branch_state.accum += float(rel_rescaled)
+                    # Telemetry: track observed rels
+                    branch_state.sum_rel += float(rel)
+                    branch_state.sum_rescaled += float(rel_rescaled)
+                    branch_state.count_rel += 1
+                    skip = branch_state.accum < float(state.thresh)
+
+            if skip and (branch_state.prev_residual is not None):
+                # Skip compute: add cached residual to current hidden states.
+                # Ensure residual is on the right device and dtype.
+                target_dtype = x.dtype
+                target_device = norm_x.device
+                res = move_residual_to(branch_state.prev_residual, target_device,
+                                       target_dtype)
+                # Shape/dtype guards: if mismatch, fall back to compute path
+                if (branch_state.shape is not None and
+                        tuple(res.shape) == tuple(branch_state.shape)):
+                    x = x + res
+                    branch_state.skipped += 1  # record skip
+                else:
+                    # Fallback: compute blocks and refresh residual
+                    state.failsafe_count += 1  # type: ignore[attr-defined]
+                    x_before = x
+                    for block in self.blocks:
+                        x = block(x, **kwargs)
+                    # Cache residual tensor in model compute dtype
+                    branch_state.prev_residual = (x - x_before).detach().to(
+                        target_dtype)
+                    branch_state.shape = tuple(branch_state.prev_residual.shape)
+                    branch_state.accum = 0.0  # reset on compute
+            else:
+                # Compute path (forced or no valid residual)
+                x_before = x
+                for block in self.blocks:
+                    x = block(x, **kwargs)
+                # Cache residual tensor in model compute dtype
+                branch_state.prev_residual = (x - x_before).detach().to(x.dtype)
+                branch_state.shape = tuple(branch_state.prev_residual.shape)
+                branch_state.accum = 0.0  # reset on compute
+
+            # Update signature for next step (stored as CPU float)
+            branch_state.prev_mod_sig = float(cur_sig)
+            # Telemetry: total gating decisions for this branch
+            branch_state.total += 1
 
         # head
         x = self.head(x, e)

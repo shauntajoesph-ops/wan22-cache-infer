@@ -23,6 +23,7 @@ from .distributed.util import get_world_size
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
+from .utils.teacache import TeaCacheState
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -30,6 +31,7 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.utils import best_output_size, masks_like
+from .distributed.util import get_world_size
 
 
 class WanTI2V:
@@ -122,6 +124,65 @@ class WanTI2V:
             self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
+        # TeaCache: configure later when timesteps are known.
+        self._teacache_cfg = None  # type: ignore
+
+    def _attach_teacache_state(self, timesteps_len: int):
+        """Attach TeaCache state to the single DiT model (TI2V).
+
+        Args:
+            timesteps_len: Number of denoising steps for this run.
+        """
+        if getattr(self, "_teacache_cfg", None) is not None:
+            return
+        self._teacache_cfg = dict(
+            enabled=getattr(self.config, "teacache", False),
+            num_steps=timesteps_len,
+            thresh=getattr(self.config, "teacache_thresh", 0.08),
+            policy=getattr(self.config, "teacache_policy", "linear"),
+            warmup=getattr(self.config, "teacache_warmup", 1),
+            last_steps=getattr(self.config, "teacache_last_steps", 1),
+        )
+        # Attach to model and inner module if FSDP-wrapped.
+        self.model.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+        self.model.teacache = TeaCacheState(
+            enabled=bool(self._teacache_cfg["enabled"]),
+            num_steps=int(self._teacache_cfg["num_steps"]),
+            thresh=float(self._teacache_cfg["thresh"]),
+            policy=str(self._teacache_cfg["policy"]),
+            warmup=int(self._teacache_cfg["warmup"]),
+            last_steps=int(self._teacache_cfg["last_steps"]),
+            sp_world_size=get_world_size(),
+        )  # type: ignore[attr-defined]
+        inner = getattr(self.model, "module", None)
+        if inner is not None:
+            inner.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+            inner.teacache = TeaCacheState(
+                enabled=bool(self._teacache_cfg["enabled"]),
+                num_steps=int(self._teacache_cfg["num_steps"]),
+                thresh=float(self._teacache_cfg["thresh"]),
+                policy=str(self._teacache_cfg["policy"]),
+                warmup=int(self._teacache_cfg["warmup"]),
+                last_steps=int(self._teacache_cfg["last_steps"]),
+                sp_world_size=get_world_size(),
+            )  # type: ignore[attr-defined]
+
+    def _log_teacache_stats(self):
+        """Log end-of-run TeaCache telemetry (rank 0 only)."""
+        target = getattr(self.model, "module", self.model)
+        st = getattr(target, "teacache", None)
+        if not st or not getattr(target, "enable_teacache", False):
+            return
+        c = st.cond
+        u = st.uncond
+        def rate(sk, tot):
+            return (100.0 * sk / tot) if tot else 0.0
+        logging.info(
+            f"TeaCache skips: cond {c.skipped}/{c.total} ({rate(c.skipped,c.total):.1f}%), "
+            f"uncond {u.skipped}/{u.total} ({rate(u.skipped,u.total):.1f}%), "
+            f"avg rel {((c.sum_rel+u.sum_rel)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+            f"avg rescaled {((c.sum_rescaled+u.sum_rescaled)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+            f"failsafe {st.failsafe_count}")
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -579,6 +640,9 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
+            # Attach TeaCache state once per run when timesteps are available.
+            self._attach_teacache_state(len(timesteps))
+
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
@@ -592,10 +656,17 @@ class WanTI2V:
                 ])
                 timestep = temp_ts.unsqueeze(0)
 
+                # TeaCache: cond branch first; increment step counter here.
+                if getattr(self.model, "enable_teacache", False):  # type: ignore[attr-defined]
+                    self.model.teacache.branch = 'cond'  # type: ignore[attr-defined]
+                    self.model.teacache.cnt += 1  # type: ignore[attr-defined]
+
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
+                if getattr(self.model, "enable_teacache", False):  # type: ignore[attr-defined]
+                    self.model.teacache.branch = 'uncond'  # type: ignore[attr-defined]
                 noise_pred_uncond = self.model(
                     latent_model_input, t=timestep, **arg_null)[0]
                 if offload_model:
@@ -631,4 +702,7 @@ class WanTI2V:
         if dist.is_initialized():
             dist.barrier()
 
+        # Emit TeaCache telemetry on rank 0 (optional).
+        if self.rank == 0:
+            self._log_teacache_stats()
         return videos[0] if self.rank == 0 else None

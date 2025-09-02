@@ -496,15 +496,20 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # TeaCache gate: conditionally skip the block stack by reusing a cached residual.
         # The gating signal is derived from block0's norm-and-modulate input.
-        # This block is guarded and has no effect unless `enable_teacache` is True and a state is set.
-        use_teacache = bool(getattr(self, "enable_teacache", False)) and getattr(
+        # FB Cache: alternative gating using first-block oriented signal.
+        # Both gates are mutually exclusive by policy; if FBCache is enabled, it takes precedence.
+        # Default behavior remains identical to baseline when both gates are disabled.
+        use_fbcache = bool(getattr(self, "enable_fbcache", False)) and getattr(
+            self, "fbcache", None) is not None
+        # This block is guarded and has no effect unless the corresponding state is set.
+        use_teacache = (not use_fbcache) and bool(getattr(self, "enable_teacache", False)) and getattr(
             self, "teacache", None) is not None
 
-        if not use_teacache:
+        if not (use_teacache or use_fbcache):
             # Baseline path (unchanged): compute all blocks.
             for block in self.blocks:
                 x = block(x, **kwargs)
-        else:
+        elif use_teacache:
             # Compute first-block modulated input as in WanAttentionBlock.forward
             block0 = self.blocks[0]
             # norm1(x) in fp32 for numerical stability
@@ -610,6 +615,140 @@ class WanModel(ModelMixin, ConfigMixin):
             branch_state.prev_mod_sig = float(cur_sig)
             # Telemetry: total gating decisions for this branch
             branch_state.total += 1
+
+        elif use_fbcache:
+            # ------------------------ FBCache gating path ------------------------
+            # We compute an early, low-cost signal tied to the first block to decide
+            # whether to reuse the previous step's full-stack residual.
+            fb_state = getattr(self, "fbcache")  # type: ignore[attr-defined]
+            assert fb_state is not None
+            fb_branch = fb_state.branch_state()
+
+            # Pre-compute first-block tensors used for hidden-based metric.
+            block0 = self.blocks[0]
+            norm_x = block0.norm1(x).float()  # Stable normalization in fp32
+            with torch.amp.autocast('cuda', dtype=torch.float32):
+                e_chunks = (block0.modulation.unsqueeze(0) + kwargs["e"]).chunk(
+                    6, dim=2)
+            mod_inp = norm_x * (1 + e_chunks[1].squeeze(2)) + e_chunks[0].squeeze(2)
+
+            # Import helpers locally to avoid circular imports at module import time.
+            from ..utils.fbcache import (
+                summarize_hidden,
+                summarize_residual,
+                rescale_metric,
+                move_residual_to as fb_move_residual_to,
+            )
+
+            # Lifecycle guards: force compute when state is uninitialized, within warmup,
+            # or within the last K executed steps. Only the cond branch increments cnt.
+            force_compute = False
+            if fb_branch.prev_sig is None:
+                force_compute = True
+            if fb_state.branch == 'cond':
+                if fb_state.cnt < fb_state.warmup:
+                    force_compute = True
+                if fb_state.cnt >= max(0, fb_state.num_steps - fb_state.last_steps):
+                    force_compute = True
+
+            # Compute current step's scalar signature according to selected metric.
+            # For 'residual_rel_l1', we need the first-block output to build the residual.
+            cur_sig = None
+            x_after_block0 = None  # used if we later decide to compute and want to reuse work
+            if fb_state.metric == 'hidden_rel_l1' or fb_state.metric == 'hidden_rel_l2':
+                cur_sig = summarize_hidden(mod_inp, fb_state.downsample)
+            elif fb_state.metric == 'residual_rel_l1':
+                # Run block0 to obtain its output; compute residual r1 = out0 - x.
+                x0_before = x
+                x_after_block0 = block0(x0_before, **kwargs)
+                r1 = (x_after_block0 - x0_before)
+                cur_sig = summarize_residual(r1, fb_state.downsample)
+            else:
+                # Fallback to hidden-based metric for unknown identifiers (conservative)
+                cur_sig = summarize_hidden(mod_inp, fb_state.downsample)
+
+            # Derive relative change vs previous signature. Optionally reuse cond diff for CFG
+            # when cfg_sep_diff is False to keep within-step consistency.
+            import math
+            if not force_compute and fb_branch.prev_sig is not None:
+                if not fb_state.cfg_sep_diff and fb_state.branch == 'uncond' and fb_state.last_cond_rel is not None:
+                    # Reuse previously computed cond diff and rescaled values.
+                    rel = fb_state.last_cond_rel
+                    rel_rescaled = fb_state.last_cond_rescaled if fb_state.last_cond_rescaled is not None else rel
+                else:
+                    prev = fb_branch.prev_sig
+                    # Relative change with epsilon to avoid division by zero.
+                    rel = abs(cur_sig - prev) / (abs(prev) + 1e-8)
+                    # Optional EMA smoothing to reduce jitter on long videos.
+                    if fb_state.ema > 0.0:
+                        if fb_branch.ema_val is None:
+                            fb_branch.ema_val = rel
+                        else:
+                            fb_branch.ema_val = fb_state.ema * fb_branch.ema_val + (1.0 - fb_state.ema) * rel
+                        rel = fb_branch.ema_val
+                    # Rescale according to policy (linear identity by default).
+                    rel_rescaled = rescale_metric(rel, 'linear')
+                # Fail-safe: invalid numbers trigger forced compute to preserve correctness.
+                if not (math.isfinite(rel)):
+                    fb_state.failsafe_count += 1
+                    force_compute = True
+            else:
+                # If we cannot compute a meaningful rel (e.g., warmup), ensure compute path.
+                rel = 0.0
+                rel_rescaled = 0.0
+
+            # Accumulate and decide skipping only if not forced.
+            skip = False
+            if not force_compute and fb_branch.prev_sig is not None:
+                fb_branch.accum += float(rel_rescaled)
+                fb_branch.sum_rel += float(rel)
+                fb_branch.sum_rescaled += float(rel_rescaled)
+                fb_branch.count_rel += 1
+                skip = fb_branch.accum < float(fb_state.thresh)
+
+            if skip and (fb_branch.prev_residual is not None):
+                # Skip compute: apply cached residual to current hidden state after ensuring device/dtype match.
+                res = fb_move_residual_to(fb_branch.prev_residual, x.device, x.dtype)
+                if (fb_branch.shape is not None and tuple(res.shape) == tuple(fb_branch.shape)):
+                    x = x + res
+                    fb_branch.skipped += 1
+                else:
+                    # Shape/dtype mismatch: treat as anomaly and fall back to compute path.
+                    fb_state.failsafe_count += 1
+                    x_before = x
+                    # Compute all blocks to refresh residual; if we already computed block0 for metric,
+                    # reuse it to avoid double compute by starting from block 1.
+                    if x_after_block0 is None:
+                        for block in self.blocks:
+                            x = block(x, **kwargs)
+                    else:
+                        x = x_after_block0
+                        for block in self.blocks[1:]:
+                            x = block(x, **kwargs)
+                    fb_branch.prev_residual = (x - x_before).detach().to(x.dtype)
+                    fb_branch.shape = tuple(fb_branch.prev_residual.shape)
+                    fb_branch.accum = 0.0
+            else:
+                # Compute path: run the full stack (reusing block0 output if we computed it for residual metric),
+                # cache the full-stack residual, and reset accumulation.
+                x_before = x
+                if x_after_block0 is None:
+                    for block in self.blocks:
+                        x = block(x, **kwargs)
+                else:
+                    x = x_after_block0
+                    for block in self.blocks[1:]:
+                        x = block(x, **kwargs)
+                fb_branch.prev_residual = (x - x_before).detach().to(x.dtype)
+                fb_branch.shape = tuple(fb_branch.prev_residual.shape)
+                fb_branch.accum = 0.0
+
+            # Update signature for next step and, if cond branch, store rel for optional CFG reuse.
+            fb_branch.prev_sig = float(cur_sig)
+            if fb_state.branch == 'cond':
+                fb_state.last_cond_rel = float(rel)
+                fb_state.last_cond_rescaled = float(rel_rescaled)
+            fb_branch.total += 1
 
         # head
         x = self.head(x, e)

@@ -30,6 +30,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.fbcache import FBCacheState, reset as _fbcache_reset
 from .utils.utils import best_output_size, masks_like
 from .distributed.util import get_world_size
 
@@ -126,6 +127,7 @@ class WanTI2V:
         self.sample_neg_prompt = config.sample_neg_prompt
         # TeaCache: configure later when timesteps are known.
         self._teacache_cfg = None  # type: ignore
+        self._fbcache_cfg = None  # type: ignore
 
     def _move_teacache_residual_to_cpu(self):
         """If TeaCache is attached, move cached residuals to CPU to free VRAM.
@@ -206,6 +208,51 @@ class WanTI2V:
                 st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
                 st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
             _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
+
+    def _attach_fbcache_state(self, timesteps_len: int):
+        """Attach FBCache to the single TI2V DiT model; reset per run.
+
+        No-op if disabled in config.
+        """
+        self._fbcache_cfg = dict(
+            enabled=getattr(self.config, "fbcache", False),
+            num_steps=timesteps_len,
+            thresh=getattr(self.config, "fb_thresh", 0.08),
+            metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")).lower(),
+            downsample=int(getattr(self.config, "fb_downsample", 1)),
+            ema=float(getattr(self.config, "fb_ema", 0.0)),
+            warmup=int(getattr(self.config, "fb_warmup", 1)),
+            last_steps=int(getattr(self.config, "fb_last_steps", 1)),
+            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", True)),
+        )
+        target = getattr(self.model, "module", self.model)
+        target.enable_fbcache = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+        if getattr(target, "fbcache", None) is None:  # type: ignore[attr-defined]
+            target.fbcache = FBCacheState(  # type: ignore[attr-defined]
+                enabled=bool(self._fbcache_cfg["enabled"]),
+                num_steps=int(self._fbcache_cfg["num_steps"]),
+                thresh=float(self._fbcache_cfg["thresh"]),
+                metric=str(self._fbcache_cfg["metric"]),
+                downsample=int(self._fbcache_cfg["downsample"]),
+                ema=float(self._fbcache_cfg["ema"]),
+                warmup=int(self._fbcache_cfg["warmup"]),
+                last_steps=int(self._fbcache_cfg["last_steps"]),
+                cfg_sep_diff=bool(self._fbcache_cfg["cfg_sep_diff"]),
+                sp_world_size=get_world_size(),
+            )
+        else:
+            st = getattr(target, "fbcache")  # type: ignore[attr-defined]
+            st.enabled = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+            st.num_steps = int(self._fbcache_cfg["num_steps"])  # type: ignore[attr-defined]
+            st.thresh = float(self._fbcache_cfg["thresh"])  # type: ignore[attr-defined]
+            st.metric = str(self._fbcache_cfg["metric"])  # type: ignore[attr-defined]
+            st.downsample = int(self._fbcache_cfg["downsample"])  # type: ignore[attr-defined]
+            st.ema = float(self._fbcache_cfg["ema"])  # type: ignore[attr-defined]
+            st.warmup = int(self._fbcache_cfg["warmup"])  # type: ignore[attr-defined]
+            st.last_steps = int(self._fbcache_cfg["last_steps"])  # type: ignore[attr-defined]
+            st.cfg_sep_diff = bool(self._fbcache_cfg["cfg_sep_diff"])  # type: ignore[attr-defined]
+            st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+        _fbcache_reset(getattr(target, "fbcache"))  # type: ignore[arg-type]
             setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
 
     def _log_teacache_stats(self):
@@ -685,8 +732,9 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            # Attach/refresh TeaCache state once per run when timesteps are available.
+            # Attach/refresh cache states once per run when timesteps are available.
             self._attach_teacache_state(len(timesteps))
+            self._attach_fbcache_state(len(timesteps))
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
@@ -701,10 +749,13 @@ class WanTI2V:
                 ])
                 timestep = temp_ts.unsqueeze(0)
 
-                # TeaCache: cond branch first; increment step counter here.
+                # TeaCache/FBCache: cond branch first; increment executed step here.
                 if getattr(self.model, "enable_teacache", False):  # type: ignore[attr-defined]
                     self.model.teacache.branch = 'cond'  # type: ignore[attr-defined]
                     self.model.teacache.cnt += 1  # type: ignore[attr-defined]
+                if getattr(self.model, "enable_fbcache", False):  # type: ignore[attr-defined]
+                    self.model.fbcache.branch = 'cond'  # type: ignore[attr-defined]
+                    self.model.fbcache.cnt += 1  # type: ignore[attr-defined]
 
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
@@ -712,6 +763,8 @@ class WanTI2V:
                     torch.cuda.empty_cache()
                 if getattr(self.model, "enable_teacache", False):  # type: ignore[attr-defined]
                     self.model.teacache.branch = 'uncond'  # type: ignore[attr-defined]
+                if getattr(self.model, "enable_fbcache", False):  # type: ignore[attr-defined]
+                    self.model.fbcache.branch = 'uncond'  # type: ignore[attr-defined]
                 noise_pred_uncond = self.model(
                     latent_model_input, t=timestep, **arg_null)[0]
                 if offload_model:

@@ -30,6 +30,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.fbcache import FBCacheState, reset as _fbcache_reset
 
 
 class WanI2V:
@@ -137,6 +138,7 @@ class WanI2V:
         self.sample_neg_prompt = config.sample_neg_prompt
         # TeaCache: will be attached per-model after sampling_steps is known.
         self._teacache_cfg = None  # type: ignore
+        self._fbcache_cfg = None  # type: ignore
 
     def _attach_teacache_state(self, timesteps_len: int):
         """
@@ -206,7 +208,7 @@ class WanI2V:
                     st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
                     st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
                 setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
-                _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
+        _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
 
     def _move_teacache_residual_to_cpu(self, model):
         """If TeaCache is attached, move cached residuals to CPU to free VRAM.
@@ -233,8 +235,74 @@ class WanI2V:
             u = st.uncond
             def rate(sk, tot):
                 return (100.0 * sk / tot) if tot else 0.0
+        logging.info(
+            f"TeaCache[{name}] skips: cond {c.skipped}/{c.total} ({rate(c.skipped,c.total):.1f}%), "
+            f"uncond {u.skipped}/{u.total} ({rate(u.skipped,u.total):.1f}%), "
+            f"avg rel {((c.sum_rel+u.sum_rel)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+            f"avg rescaled {((c.sum_rescaled+u.sum_rescaled)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+            f"failsafe {st.failsafe_count}")
+
+    def _attach_fbcache_state(self, timesteps_len: int):
+        """Attach or refresh FBCache state for both experts; reset per run.
+
+        Mirrors TeaCache lifecycle and flags, following FB_CACHE.md. This
+        function is a no-op if FBCache is disabled in the config.
+        """
+        self._fbcache_cfg = dict(
+            enabled=getattr(self.config, "fbcache", False),
+            num_steps=timesteps_len,
+            thresh=getattr(self.config, "fb_thresh", 0.08),
+            metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")).lower(),
+            downsample=int(getattr(self.config, "fb_downsample", 1)),
+            ema=float(getattr(self.config, "fb_ema", 0.0)),
+            warmup=int(getattr(self.config, "fb_warmup", 1)),
+            last_steps=int(getattr(self.config, "fb_last_steps", 1)),
+            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", True)),
+        )
+        # Attach to both experts and their inner modules (if wrapped)
+        for model in (self.low_noise_model, self.high_noise_model):
+            target = getattr(model, "module", model)
+            target.enable_fbcache = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+            if getattr(target, "fbcache", None) is None:  # type: ignore[attr-defined]
+                target.fbcache = FBCacheState(  # type: ignore[attr-defined]
+                    enabled=bool(self._fbcache_cfg["enabled"]),
+                    num_steps=int(self._fbcache_cfg["num_steps"]),
+                    thresh=float(self._fbcache_cfg["thresh"]),
+                    metric=str(self._fbcache_cfg["metric"]),
+                    downsample=int(self._fbcache_cfg["downsample"]),
+                    ema=float(self._fbcache_cfg["ema"]),
+                    warmup=int(self._fbcache_cfg["warmup"]),
+                    last_steps=int(self._fbcache_cfg["last_steps"]),
+                    cfg_sep_diff=bool(self._fbcache_cfg["cfg_sep_diff"]),
+                    sp_world_size=get_world_size(),
+                )
+            else:
+                st = getattr(target, "fbcache")  # type: ignore[attr-defined]
+                st.enabled = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+                st.num_steps = int(self._fbcache_cfg["num_steps"])  # type: ignore[attr-defined]
+                st.thresh = float(self._fbcache_cfg["thresh"])  # type: ignore[attr-defined]
+                st.metric = str(self._fbcache_cfg["metric"])  # type: ignore[attr-defined]
+                st.downsample = int(self._fbcache_cfg["downsample"])  # type: ignore[attr-defined]
+                st.ema = float(self._fbcache_cfg["ema"])  # type: ignore[attr-defined]
+                st.warmup = int(self._fbcache_cfg["warmup"])  # type: ignore[attr-defined]
+                st.last_steps = int(self._fbcache_cfg["last_steps"])  # type: ignore[attr-defined]
+                st.cfg_sep_diff = bool(self._fbcache_cfg["cfg_sep_diff"])  # type: ignore[attr-defined]
+                st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+            _fbcache_reset(getattr(target, "fbcache"))  # type: ignore[arg-type]
+
+    def _log_fbcache_stats(self):
+        """Log end-of-run FBCache telemetry for both experts (rank 0 only)."""
+        for name, m in (("low", self.low_noise_model), ("high", self.high_noise_model)):
+            target = getattr(m, "module", m)
+            st = getattr(target, "fbcache", None)
+            if not st or not getattr(target, "enable_fbcache", False):
+                continue
+            c = st.cond
+            u = st.uncond
+            def rate(sk, tot):
+                return (100.0 * sk / tot) if tot else 0.0
             logging.info(
-                f"TeaCache[{name}] skips: cond {c.skipped}/{c.total} ({rate(c.skipped,c.total):.1f}%), "
+                f"FBCache[{name}] skips: cond {c.skipped}/{c.total} ({rate(c.skipped,c.total):.1f}%), "
                 f"uncond {u.skipped}/{u.total} ({rate(u.skipped,u.total):.1f}%), "
                 f"avg rel {((c.sum_rel+u.sum_rel)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
                 f"avg rescaled {((c.sum_rescaled+u.sum_rescaled)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
@@ -501,8 +569,9 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
-            # Attach/refresh TeaCache state to experts after timesteps are known (once per run).
+            # Attach/refresh TeaCache and FBCache states to experts after timesteps are known (once per run).
             self._attach_teacache_state(len(timesteps))
+            self._attach_fbcache_state(len(timesteps))
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
@@ -567,4 +636,5 @@ class WanI2V:
         # Emit TeaCache telemetry on rank 0 if enabled.
         if self.rank == 0:
             self._log_teacache_stats()
+            self._log_fbcache_stats()
         return videos[0] if self.rank == 0 else None

@@ -36,6 +36,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.fbcache import FBCacheState, reset as _fbcache_reset
 
 
 def load_safetensors(path):
@@ -151,6 +152,7 @@ class WanS2V:
         self.audio_sample_m = 0
         # TeaCache: configured once per run when timesteps are known.
         self._teacache_cfg = None  # type: ignore
+        self._fbcache_cfg = None  # type: ignore
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -263,6 +265,77 @@ class WanS2V:
                 st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
                 st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
             _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
+
+    def _attach_fbcache_state(self, timesteps_len: int):
+        """Attach FBCache to S2V noise model; reset per run. No-op if disabled."""
+        self._fbcache_cfg = dict(
+            enabled=getattr(self.config, "fbcache", False),
+            num_steps=timesteps_len,
+            thresh=getattr(self.config, "fb_thresh", 0.08),
+            metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")).lower(),
+            downsample=int(getattr(self.config, "fb_downsample", 1)),
+            ema=float(getattr(self.config, "fb_ema", 0.0)),
+            warmup=int(getattr(self.config, "fb_warmup", 1)),
+            last_steps=int(getattr(self.config, "fb_last_steps", 1)),
+            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", True)),
+        )
+        target = self.noise_model
+        target.enable_fbcache = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+        if getattr(target, "fbcache", None) is None:  # type: ignore[attr-defined]
+            target.fbcache = FBCacheState(  # type: ignore[attr-defined]
+                enabled=bool(self._fbcache_cfg["enabled"]),
+                num_steps=int(self._fbcache_cfg["num_steps"]),
+                thresh=float(self._fbcache_cfg["thresh"]),
+                metric=str(self._fbcache_cfg["metric"]),
+                downsample=int(self._fbcache_cfg["downsample"]),
+                ema=float(self._fbcache_cfg["ema"]),
+                warmup=int(self._fbcache_cfg["warmup"]),
+                last_steps=int(self._fbcache_cfg["last_steps"]),
+                cfg_sep_diff=bool(self._fbcache_cfg["cfg_sep_diff"]),
+                sp_world_size=get_world_size(),
+            )
+        else:
+            st = getattr(target, "fbcache")  # type: ignore[attr-defined]
+            st.enabled = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+            st.num_steps = int(self._fbcache_cfg["num_steps"])  # type: ignore[attr-defined]
+            st.thresh = float(self._fbcache_cfg["thresh"])  # type: ignore[attr-defined]
+            st.metric = str(self._fbcache_cfg["metric"])  # type: ignore[attr-defined]
+            st.downsample = int(self._fbcache_cfg["downsample"])  # type: ignore[attr-defined]
+            st.ema = float(self._fbcache_cfg["ema"])  # type: ignore[attr-defined]
+            st.warmup = int(self._fbcache_cfg["warmup"])  # type: ignore[attr-defined]
+            st.last_steps = int(self._fbcache_cfg["last_steps"])  # type: ignore[attr-defined]
+            st.cfg_sep_diff = bool(self._fbcache_cfg["cfg_sep_diff"])  # type: ignore[attr-defined]
+            st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+        _fbcache_reset(getattr(target, "fbcache"))  # type: ignore[arg-type]
+        inner = getattr(target, "module", None)
+        if inner is not None:
+            inner.enable_fbcache = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+            if getattr(inner, "fbcache", None) is None:  # type: ignore[attr-defined]
+                inner.fbcache = FBCacheState(  # type: ignore[attr-defined]
+                    enabled=bool(self._fbcache_cfg["enabled"]),
+                    num_steps=int(self._fbcache_cfg["num_steps"]),
+                    thresh=float(self._fbcache_cfg["thresh"]),
+                    metric=str(self._fbcache_cfg["metric"]),
+                    downsample=int(self._fbcache_cfg["downsample"]),
+                    ema=float(self._fbcache_cfg["ema"]),
+                    warmup=int(self._fbcache_cfg["warmup"]),
+                    last_steps=int(self._fbcache_cfg["last_steps"]),
+                    cfg_sep_diff=bool(self._fbcache_cfg["cfg_sep_diff"]),
+                    sp_world_size=get_world_size(),
+                )
+            else:
+                st_in = getattr(inner, "fbcache")  # type: ignore[attr-defined]
+                st_in.enabled = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+                st_in.num_steps = int(self._fbcache_cfg["num_steps"])  # type: ignore[attr-defined]
+                st_in.thresh = float(self._fbcache_cfg["thresh"])  # type: ignore[attr-defined]
+                st_in.metric = str(self._fbcache_cfg["metric"])  # type: ignore[attr-defined]
+                st_in.downsample = int(self._fbcache_cfg["downsample"])  # type: ignore[attr-defined]
+                st_in.ema = float(self._fbcache_cfg["ema"])  # type: ignore[attr-defined]
+                st_in.warmup = int(self._fbcache_cfg["warmup"])  # type: ignore[attr-defined]
+                st_in.last_steps = int(self._fbcache_cfg["last_steps"])  # type: ignore[attr-defined]
+                st_in.cfg_sep_diff = bool(self._fbcache_cfg["cfg_sep_diff"])  # type: ignore[attr-defined]
+                st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+            _fbcache_reset(getattr(inner, "fbcache"))  # type: ignore[arg-type]
             setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
 
     def _move_teacache_residual_to_cpu(self):

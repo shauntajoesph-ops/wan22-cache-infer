@@ -73,6 +73,17 @@ def _validate_args(args):
     cfg.teacache_last_steps = args.teacache_last_steps
     cfg.teacache_alternating = args.teacache_alternating
 
+    # Propagate FBCache flags similarly; pipelines may attach per-model FBCache state.
+    cfg.fbcache = getattr(args, "fbcache", False)
+    cfg.fb_thresh = getattr(args, "fb_thresh", 0.08)
+    cfg.fb_metric = getattr(args, "fb_metric", "hidden_rel_l1")
+    cfg.fb_downsample = getattr(args, "fb_downsample", 1)
+    cfg.fb_ema = getattr(args, "fb_ema", 0.0)
+    cfg.fb_warmup = getattr(args, "fb_warmup", 1)
+    cfg.fb_last_steps = getattr(args, "fb_last_steps", 1)
+    cfg.fb_cfg_sep_diff = getattr(args, "fb_cfg_sep_diff", True)
+    cfg.teacache_alternating = args.teacache_alternating
+
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
 
@@ -247,6 +258,57 @@ def _parse_args():
             "Enable alternating skip eligibility (every other executed step). "
             "Useful to smooth long sequences of reuses; default off."
         ),
+    )
+
+    # FBCache flags (I2V/TI2V only). Defaults are conservative.
+    parser.add_argument(
+        "--fbcache",
+        action="store_true",
+        default=False,
+        help="Enable First-Block Cache (FBCache) gating (I2V/TI2V only).",
+    )
+    parser.add_argument(
+        "--fb_thresh",
+        type=float,
+        default=0.08,
+        help="FBCache threshold (relative metric accumulator). Conservative default 0.08.",
+    )
+    parser.add_argument(
+        "--fb_metric",
+        type=str,
+        default="hidden_rel_l1",
+        choices=["hidden_rel_l1", "residual_rel_l1", "hidden_rel_l2"],
+        help="FBCache gating metric (default: hidden_rel_l1).",
+    )
+    parser.add_argument(
+        "--fb_downsample",
+        type=int,
+        default=1,
+        help="Stride for computing the FBCache metric over tokens (1,2,4).",
+    )
+    parser.add_argument(
+        "--fb_ema",
+        type=float,
+        default=0.0,
+        help="EMA factor in [0,1) for smoothing the metric (0 disables).",
+    )
+    parser.add_argument(
+        "--fb_warmup",
+        type=int,
+        default=1,
+        help="Force compute during the first K executed steps for FBCache.",
+    )
+    parser.add_argument(
+        "--fb_last_steps",
+        type=int,
+        default=1,
+        help="Force compute for the last K executed steps for FBCache.",
+    )
+    parser.add_argument(
+        "--fb_cfg_sep_diff",
+        type=str2bool,
+        default=True,
+        help="If true, compute CFG diff separately; else reuse cond diff for CFG.",
     )
     parser.add_argument(
         "--convert_model_dtype",

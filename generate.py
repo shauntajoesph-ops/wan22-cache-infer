@@ -71,6 +71,7 @@ def _validate_args(args):
     cfg.teacache_policy = args.teacache_policy
     cfg.teacache_warmup = args.teacache_warmup
     cfg.teacache_last_steps = args.teacache_last_steps
+    cfg.teacache_alternating = args.teacache_alternating
 
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
@@ -237,6 +238,15 @@ def _parse_args():
         type=int,
         default=1,
         help="Number of final steps to force compute."
+    )
+    parser.add_argument(
+        "--teacache_alternating",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable alternating skip eligibility (every other executed step). "
+            "Useful to smooth long sequences of reuses; default off."
+        ),
     )
     parser.add_argument(
         "--convert_model_dtype",

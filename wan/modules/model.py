@@ -536,6 +536,10 @@ class WanModel(ModelMixin, ConfigMixin):
                     force_compute = True
                 if state.cnt >= max(0, state.num_steps - state.last_steps):
                     force_compute = True
+                # Optional alternating guard: only every other executed step eligible to skip
+                if bool(getattr(self, "alternating_teacache", False)):
+                    if (state.cnt % 2) == 1:
+                        force_compute = True
 
             # Compute relative change if possible
             skip = False

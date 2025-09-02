@@ -155,6 +155,7 @@ class WanTI2V:
             policy=str(getattr(self.config, "teacache_policy", "linear")).lower(),
             warmup=getattr(self.config, "teacache_warmup", 1),
             last_steps=getattr(self.config, "teacache_last_steps", 1),
+            alternating=bool(getattr(self.config, "teacache_alternating", False)),
         )
         from .utils.teacache import reset as _teacache_reset
         # Attach to model and inner module if FSDP-wrapped; reset per run
@@ -179,6 +180,8 @@ class WanTI2V:
             st.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
             st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
         _teacache_reset(getattr(self.model, "teacache"))  # type: ignore[arg-type]
+        # Module-level alternating switch to avoid expanding state schema
+        setattr(self.model, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
 
         inner = getattr(self.model, "module", None)
         if inner is not None:
@@ -203,6 +206,7 @@ class WanTI2V:
                 st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
                 st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
             _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
+            setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
 
     def _log_teacache_stats(self):
         """Log end-of-run TeaCache telemetry (rank 0 only)."""

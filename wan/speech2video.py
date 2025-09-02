@@ -213,6 +213,7 @@ class WanS2V:
             policy=str(getattr(self.config, "teacache_policy", "linear")).lower(),
             warmup=getattr(self.config, "teacache_warmup", 1),
             last_steps=getattr(self.config, "teacache_last_steps", 1),
+            alternating=bool(getattr(self.config, "teacache_alternating", False)),
         )
         from .utils.teacache import reset as _teacache_reset
         target = self.noise_model
@@ -237,6 +238,7 @@ class WanS2V:
             st.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
             st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
         _teacache_reset(getattr(target, "teacache"))  # type: ignore[arg-type]
+        setattr(target, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
 
         inner = getattr(target, "module", None)
         if inner is not None:
@@ -261,6 +263,7 @@ class WanS2V:
                 st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
                 st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
             _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
+            setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
 
     def _move_teacache_residual_to_cpu(self):
         """If TeaCache is attached, move cached residuals to CPU to free VRAM when offloading."""

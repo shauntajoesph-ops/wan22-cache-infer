@@ -160,6 +160,10 @@ def sp_dit_forward(
                 force_compute = True
             if state.cnt >= max(0, state.num_steps - state.last_steps):
                 force_compute = True
+            # Optional alternating guard
+            if bool(getattr(self, "alternating_teacache", False)):
+                if (state.cnt % 2) == 1:
+                    force_compute = True
 
         skip = False
         cur_sig = summarize_mod(mod_inp)

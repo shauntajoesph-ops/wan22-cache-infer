@@ -153,6 +153,7 @@ class WanI2V:
             policy=str(getattr(self.config, "teacache_policy", "linear")).lower(),
             warmup=getattr(self.config, "teacache_warmup", 1),
             last_steps=getattr(self.config, "teacache_last_steps", 1),
+            alternating=bool(getattr(self.config, "teacache_alternating", False)),
         )
         from .utils.teacache import reset as _teacache_reset
         for m in (self.low_noise_model, self.high_noise_model):
@@ -177,6 +178,8 @@ class WanI2V:
                 st.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
                 st.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
                 st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+            # Alternating flag is attached at module-level to avoid polluting state schema.
+            setattr(m, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
             _teacache_reset(getattr(m, "teacache"))  # type: ignore[arg-type]
 
             # Attach or refresh on inner module if FSDP-wrapped
@@ -202,6 +205,7 @@ class WanI2V:
                     st_in.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
                     st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
                     st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+                setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
                 _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
 
     def _move_teacache_residual_to_cpu(self, model):

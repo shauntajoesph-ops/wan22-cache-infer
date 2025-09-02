@@ -209,6 +209,13 @@ class WanT2V:
                     self,
                     offload_model_name).parameters()).device.type == 'cuda':
                 getattr(self, offload_model_name).to('cpu')
+                # Ensure cached residuals move to CPU along with model offload
+                target = getattr(getattr(self, offload_model_name), "module", getattr(self, offload_model_name))
+                st = getattr(target, "teacache", None)
+                if st:
+                    for br in (st.cond, st.uncond):
+                        if br.prev_residual is not None and br.prev_residual.device.type == 'cuda':
+                            br.prev_residual = br.prev_residual.to('cpu')
             if next(getattr(
                     self,
                     required_model_name).parameters()).device.type == 'cpu':

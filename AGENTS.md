@@ -20,11 +20,14 @@
     - `--teacache_policy`: rescale policy (`linear` default; unknown values fall back to `linear`)
     - `--teacache_warmup`: force compute first K steps (default 1)
     - `--teacache_last_steps`: force compute last K steps (default 1)
+    - `--teacache_alternating`: alternate skip eligibility (default off). Helps stabilize long sequences of reuses.
+    - Design doc: see [CFG_CACHE_DESIGN.md](CFG_CACHE_DESIGN.md) for architecture and details.
   - Notes and caveats:
     - State resets per run; cached residuals are cleared before each generation.
     - In SP/Ulysses mode, ranks synchronize a scalar decision each step; ensure ranks are aligned.
     - On shape/dtype mismatch or invalid metrics, compute is forced (failsafe) and accumulator resets.
     - Offload mode moves cached residuals to CPU when models are offloaded to release VRAM (I2V/TI2V/S2V).
+    - In separate‑CFG pipelines (Wan2.2), the cond branch increments the executed step; warmup/last‑steps apply to cond; uncond shares the same timestep index.
 - Tests (E2E): `bash tests/test.sh <local model dir> <gpu number>`.
 - TeaCache smoke tests: `bash tests/test_teacache.sh <local model dir> [gpu number]`.
 - TeaCache benchmarks: `bash benchmarks/bench_teacache.sh <local model dir>`.

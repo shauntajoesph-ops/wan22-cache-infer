@@ -29,6 +29,7 @@ from .modules.s2v.audio_encoder import AudioEncoder
 from .modules.s2v.model_s2v import WanModel_S2V, sp_attn_forward_s2v
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
+from .utils.teacache import TeaCacheState
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -148,6 +149,8 @@ class WanS2V:
         self.drop_first_motion = config.drop_first_motion
         self.fps = config.sample_fps
         self.audio_sample_m = 0
+        # TeaCache: configured once per run when timesteps are known.
+        self._teacache_cfg = None  # type: ignore
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -195,6 +198,79 @@ class WanS2V:
                 model.to(self.device)
 
         return model
+
+    def _attach_teacache_state(self, timesteps_len: int):
+        """Attach TeaCache state to the S2V noise model (and inner module if wrapped).
+
+        Args:
+            timesteps_len: Number of denoising steps for this run.
+        """
+        # Refresh config each run
+        self._teacache_cfg = dict(
+            enabled=getattr(self.config, "teacache", False),
+            num_steps=timesteps_len,
+            thresh=getattr(self.config, "teacache_thresh", 0.08),
+            policy=str(getattr(self.config, "teacache_policy", "linear")).lower(),
+            warmup=getattr(self.config, "teacache_warmup", 1),
+            last_steps=getattr(self.config, "teacache_last_steps", 1),
+        )
+        from .utils.teacache import reset as _teacache_reset
+        target = self.noise_model
+        target.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+        if getattr(target, "teacache", None) is None:  # type: ignore[attr-defined]
+            target.teacache = TeaCacheState(  # type: ignore[attr-defined]
+                enabled=bool(self._teacache_cfg["enabled"]),
+                num_steps=int(self._teacache_cfg["num_steps"]),
+                thresh=float(self._teacache_cfg["thresh"]),
+                policy=str(self._teacache_cfg["policy"]),
+                warmup=int(self._teacache_cfg["warmup"]),
+                last_steps=int(self._teacache_cfg["last_steps"]),
+                sp_world_size=get_world_size(),
+            )
+        else:
+            st = getattr(target, "teacache")  # type: ignore[attr-defined]
+            st.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+            st.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
+            st.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
+            st.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
+            st.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
+            st.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
+            st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+        _teacache_reset(getattr(target, "teacache"))  # type: ignore[arg-type]
+
+        inner = getattr(target, "module", None)
+        if inner is not None:
+            inner.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+            if getattr(inner, "teacache", None) is None:  # type: ignore[attr-defined]
+                inner.teacache = TeaCacheState(  # type: ignore[attr-defined]
+                    enabled=bool(self._teacache_cfg["enabled"]),
+                    num_steps=int(self._teacache_cfg["num_steps"]),
+                    thresh=float(self._teacache_cfg["thresh"]),
+                    policy=str(self._teacache_cfg["policy"]),
+                    warmup=int(self._teacache_cfg["warmup"]),
+                    last_steps=int(self._teacache_cfg["last_steps"]),
+                    sp_world_size=get_world_size(),
+                )
+            else:
+                st_in = getattr(inner, "teacache")  # type: ignore[attr-defined]
+                st_in.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+                st_in.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
+                st_in.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
+                st_in.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
+                st_in.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
+                st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
+                st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+            _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
+
+    def _move_teacache_residual_to_cpu(self):
+        """If TeaCache is attached, move cached residuals to CPU to free VRAM when offloading."""
+        target = getattr(self.noise_model, "module", self.noise_model)
+        st = getattr(target, "teacache", None)
+        if not st:
+            return
+        for br in (st.cond, st.uncond):
+            if br.prev_residual is not None and br.prev_residual.device.type == 'cuda':
+                br.prev_residual = br.prev_residual.to('cpu')
 
     def get_size_less_than_area(self,
                                 height,
@@ -583,6 +659,8 @@ class WanS2V:
                     raise NotImplementedError("Unsupported solver.")
 
                 latents = deepcopy(noise)
+                # Attach/refresh TeaCache state to noise model once per run when timesteps are known.
+                self._attach_teacache_state(len(timesteps))
                 with torch.no_grad():
                     left_idx = r * infer_frames
                     right_idx = r * infer_frames + infer_frames
@@ -624,11 +702,20 @@ class WanS2V:
                     timestep = [t]
 
                     timestep = torch.stack(timestep).to(self.device)
+                    # TeaCache: Set branch to 'cond' and increment step counter for cond only.
+                    if getattr(self.noise_model, "enable_teacache", False):  # type: ignore[attr-defined]
+                        target = getattr(self.noise_model, "module", self.noise_model)
+                        target.teacache.branch = 'cond'  # type: ignore[attr-defined]
+                        target.teacache.cnt += 1  # type: ignore[attr-defined]
 
                     noise_pred_cond = self.noise_model(
                         latent_model_input, t=timestep, **arg_c)
 
                     if guide_scale > 1:
+                        # TeaCache: switch to 'uncond' branch for the second pass.
+                        if getattr(self.noise_model, "enable_teacache", False):  # type: ignore[attr-defined]
+                            target = getattr(self.noise_model, "module", self.noise_model)
+                            target.teacache.branch = 'uncond'  # type: ignore[attr-defined]
                         noise_pred_uncond = self.noise_model(
                             latent_model_input, t=timestep, **arg_null)
                         noise_pred = [
@@ -648,6 +735,8 @@ class WanS2V:
 
                 if offload_model:
                     self.noise_model.cpu()
+                    # Move cached residuals to CPU as well to release VRAM.
+                    self._move_teacache_residual_to_cpu()
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                 latents = torch.stack(latents)

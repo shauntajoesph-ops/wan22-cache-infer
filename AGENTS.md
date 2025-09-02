@@ -10,16 +10,24 @@
 - Install: `pip install .` and `pip install .[dev]` (or `poetry install`).
 - Run (single GPU): `python generate.py --task t2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-T2V-A14B --prompt "..."`.
 - Run (multi‑GPU): `torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B --dit_fsdp --t5_fsdp --ulysses_size 8`.
-  - TeaCache (I2V/TI2V only): add `--teacache --teacache_thresh 0.08` to enable conditional transformer skipping for speedups (~1.3–2.0x depending on threshold). Example:
+  - TeaCache (I2V/TI2V/S2V): add `--teacache --teacache_thresh 0.08` to enable conditional transformer skipping for speedups (~1.3–2.0x depending on threshold). Examples:
     - Single GPU TI2V: `python generate.py --task ti2v-5B --size 1280*704 --ckpt_dir ./Wan2.2-TI2V-5B --teacache --teacache_thresh 0.08`
     - Multi-GPU I2V: `torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B --dit_fsdp --t5_fsdp --ulysses_size 8 --teacache --teacache_thresh 0.08`
+    - Single GPU S2V: `python generate.py --task s2v-14B --ckpt_dir ./Wan2.2-S2V-14B --image examples/i2v_input.JPG --audio examples/talk.wav --teacache --teacache_thresh 0.08`
   - TeaCache flags:
     - `--teacache`: enable (disabled by default)
     - `--teacache_thresh`: skip aggressiveness (default 0.08)
-    - `--teacache_policy`: rescale policy (`linear` default)
+    - `--teacache_policy`: rescale policy (`linear` default; unknown values fall back to `linear`)
     - `--teacache_warmup`: force compute first K steps (default 1)
     - `--teacache_last_steps`: force compute last K steps (default 1)
+  - Notes and caveats:
+    - State resets per run; cached residuals are cleared before each generation.
+    - In SP/Ulysses mode, ranks synchronize a scalar decision each step; ensure ranks are aligned.
+    - On shape/dtype mismatch or invalid metrics, compute is forced (failsafe) and accumulator resets.
+    - Offload mode moves cached residuals to CPU when models are offloaded to release VRAM (I2V/TI2V/S2V).
 - Tests (E2E): `bash tests/test.sh <local model dir> <gpu number>`.
+- TeaCache smoke tests: `bash tests/test_teacache.sh <local model dir> [gpu number]`.
+- TeaCache benchmarks: `bash benchmarks/bench_teacache.sh <local model dir>`.
 - Format: `make format` (isort + yapf) or `black . && isort .`.
 
 ## Coding Style & Naming Conventions

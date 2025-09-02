@@ -127,37 +127,40 @@ class WanTI2V:
         # TeaCache: configure later when timesteps are known.
         self._teacache_cfg = None  # type: ignore
 
+    def _move_teacache_residual_to_cpu(self):
+        """If TeaCache is attached, move cached residuals to CPU to free VRAM.
+
+        Called when the model is offloaded to CPU; residuals are not parameters,
+        so `.to('cpu')` on the module does not move them automatically.
+        """
+        target = getattr(self.model, "module", self.model)
+        st = getattr(target, "teacache", None)
+        if not st:
+            return
+        for br in (st.cond, st.uncond):
+            if br.prev_residual is not None and br.prev_residual.device.type == 'cuda':
+                br.prev_residual = br.prev_residual.to('cpu')
+
     def _attach_teacache_state(self, timesteps_len: int):
         """Attach TeaCache state to the single DiT model (TI2V).
 
         Args:
             timesteps_len: Number of denoising steps for this run.
         """
-        if getattr(self, "_teacache_cfg", None) is not None:
-            return
+        # Refresh config each run
         self._teacache_cfg = dict(
             enabled=getattr(self.config, "teacache", False),
             num_steps=timesteps_len,
             thresh=getattr(self.config, "teacache_thresh", 0.08),
-            policy=getattr(self.config, "teacache_policy", "linear"),
+            policy=str(getattr(self.config, "teacache_policy", "linear")).lower(),
             warmup=getattr(self.config, "teacache_warmup", 1),
             last_steps=getattr(self.config, "teacache_last_steps", 1),
         )
-        # Attach to model and inner module if FSDP-wrapped.
+        from .utils.teacache import reset as _teacache_reset
+        # Attach to model and inner module if FSDP-wrapped; reset per run
         self.model.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-        self.model.teacache = TeaCacheState(
-            enabled=bool(self._teacache_cfg["enabled"]),
-            num_steps=int(self._teacache_cfg["num_steps"]),
-            thresh=float(self._teacache_cfg["thresh"]),
-            policy=str(self._teacache_cfg["policy"]),
-            warmup=int(self._teacache_cfg["warmup"]),
-            last_steps=int(self._teacache_cfg["last_steps"]),
-            sp_world_size=get_world_size(),
-        )  # type: ignore[attr-defined]
-        inner = getattr(self.model, "module", None)
-        if inner is not None:
-            inner.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-            inner.teacache = TeaCacheState(
+        if getattr(self.model, "teacache", None) is None:  # type: ignore[attr-defined]
+            self.model.teacache = TeaCacheState(  # type: ignore[attr-defined]
                 enabled=bool(self._teacache_cfg["enabled"]),
                 num_steps=int(self._teacache_cfg["num_steps"]),
                 thresh=float(self._teacache_cfg["thresh"]),
@@ -165,7 +168,41 @@ class WanTI2V:
                 warmup=int(self._teacache_cfg["warmup"]),
                 last_steps=int(self._teacache_cfg["last_steps"]),
                 sp_world_size=get_world_size(),
-            )  # type: ignore[attr-defined]
+            )
+        else:
+            st = getattr(self.model, "teacache")  # type: ignore[attr-defined]
+            st.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+            st.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
+            st.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
+            st.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
+            st.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
+            st.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
+            st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+        _teacache_reset(getattr(self.model, "teacache"))  # type: ignore[arg-type]
+
+        inner = getattr(self.model, "module", None)
+        if inner is not None:
+            inner.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+            if getattr(inner, "teacache", None) is None:  # type: ignore[attr-defined]
+                inner.teacache = TeaCacheState(  # type: ignore[attr-defined]
+                    enabled=bool(self._teacache_cfg["enabled"]),
+                    num_steps=int(self._teacache_cfg["num_steps"]),
+                    thresh=float(self._teacache_cfg["thresh"]),
+                    policy=str(self._teacache_cfg["policy"]),
+                    warmup=int(self._teacache_cfg["warmup"]),
+                    last_steps=int(self._teacache_cfg["last_steps"]),
+                    sp_world_size=get_world_size(),
+                )
+            else:
+                st_in = getattr(inner, "teacache")  # type: ignore[attr-defined]
+                st_in.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+                st_in.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
+                st_in.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
+                st_in.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
+                st_in.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
+                st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
+                st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+            _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
 
     def _log_teacache_stats(self):
         """Log end-of-run TeaCache telemetry (rank 0 only)."""
@@ -406,6 +443,10 @@ class WanTI2V:
                 inference_guard(),
                 no_sync(),
         ):
+            # Ensure TeaCache state is freshly attached/reset for this run
+            # (do it here as an extra guard in case callers invoke generate() twice)
+            # Note: _attach_teacache_state also handles resetting existing states.
+            # We call it once actual timesteps are known below.
 
             # OPTIM: Device-resident solver timesteps avoid host transfers.
             if sample_solver == 'unipc':
@@ -640,7 +681,7 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            # Attach TeaCache state once per run when timesteps are available.
+            # Attach/refresh TeaCache state once per run when timesteps are available.
             self._attach_teacache_state(len(timesteps))
 
             for _, t in enumerate(tqdm(timesteps)):
@@ -688,6 +729,8 @@ class WanTI2V:
 
             if offload_model:
                 self.model.cpu()
+                # Move cached residuals to CPU as well to release VRAM.
+                self._move_teacache_residual_to_cpu()
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 

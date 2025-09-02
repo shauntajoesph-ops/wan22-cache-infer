@@ -342,6 +342,12 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
 
         self.use_context_parallel = False  # will modify in _configure_model func
 
+        # TeaCache integration (Phase 2 for S2V):
+        # - Disabled by default; the S2V pipeline attaches a TeaCacheState when enabled.
+        # - Kept generic to mirror Phase 1 behavior (I2V/TI2V) for consistency.
+        self.enable_teacache = False  # type: ignore[attr-defined]
+        self.teacache = None  # type: ignore[attr-defined]
+
         if cond_dim > 0:
             self.cond_encoder = nn.Conv3d(
                 cond_dim,
@@ -842,9 +848,107 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             freqs=self.pre_compute_freqs,
             context=context,
             context_lens=context_lens)
-        for idx, block in enumerate(self.blocks):
-            x = block(x, **kwargs)
-            x = self.after_transformer_block(idx, x)
+        # TeaCache gate: decide whether to skip the transformer block stack and reuse a cached residual.
+        # This mirrors Phase 1 but accounts for S2V's segmented time modulation.
+        use_teacache = bool(getattr(self, "enable_teacache", False)) and getattr(
+            self, "teacache", None) is not None
+
+        if not use_teacache:
+            # Baseline compute path (unchanged): run through all blocks and audio injections.
+            for idx, block in enumerate(self.blocks):
+                x = block(x, **kwargs)
+                x = self.after_transformer_block(idx, x)
+        else:
+            # Compute Block-0 modulated input to form the TeaCache gating signal.
+            block0 = self.blocks[0]
+            # Normalize in fp32 for stability (shape: [B, L, C]).
+            norm_x = block0.norm1(x).float()
+            # Retrieve time-modulation tensor and segment index from e0 (prepared earlier to handle SP).
+            e_tensor, seg_val = e0  # e_tensor: [B, 6, 2, C], seg_val: int token split
+            modulation = block0.modulation.unsqueeze(2)  # [1, 6, 1, C]
+            with amp.autocast(dtype=torch.float32):
+                # Combine learned modulation with time embedding and split into 6 parts.
+                e_chunks = (modulation + e_tensor).chunk(6, dim=1)
+            # Squeeze the chunked dimension to obtain [B, 2, C] parts for each of the 6 groups.
+            e_chunks = [u.squeeze(1) for u in e_chunks]
+            # Build per-segment modulated input exactly as in WanS2VAttentionBlock.forward.
+            seg_idx = int(max(0, min(int(seg_val), x.size(1))))  # clamp to [0, L]
+            # First segment: tokens [:seg_idx]; second segment: tokens [seg_idx:]
+            seg0 = norm_x[:, :seg_idx] * (1 + e_chunks[1][:, 0:1]) + e_chunks[0][:, 0:1]
+            seg1 = norm_x[:, seg_idx:] * (1 + e_chunks[1][:, 1:2]) + e_chunks[0][:, 1:2]
+            mod_inp = torch.cat([seg0, seg1], dim=1)  # [B, L, C]
+
+            # Import helpers locally to avoid circular imports at module load.
+            from ...utils.teacache import summarize_mod, rescale
+            import math
+            state = getattr(self, "teacache")  # type: ignore[attr-defined]
+            branch_state = state.branch_state()
+
+            # Decide if we need to force compute due to lifecycle rules (first use, warmup, last steps).
+            force_compute = False
+            if branch_state.prev_mod_sig is None:
+                force_compute = True
+            if state.branch == 'cond':
+                if state.cnt < state.warmup:
+                    force_compute = True
+                if state.cnt >= max(0, state.num_steps - state.last_steps):
+                    force_compute = True
+
+            # Compute scalar signature and relative change.
+            skip = False
+            cur_sig = summarize_mod(mod_inp)
+            if not force_compute and branch_state.prev_mod_sig is not None:
+                prev = branch_state.prev_mod_sig
+                rel = abs(cur_sig - prev) / (abs(prev) + 1e-8)
+                # Synchronize decision across ranks in context-parallel (sequence-parallel) mode.
+                if self.use_context_parallel:
+                    import torch.distributed as dist
+                    rel_t = torch.tensor([rel], device=norm_x.device, dtype=torch.float32)
+                    dist.all_reduce(rel_t, op=dist.ReduceOp.SUM)
+                    world = get_world_size()
+                    rel = float(rel_t.item() / max(1, int(world)))
+                rel_rescaled = rescale(rel, state.policy)
+                # Fail-safe: if invalid values arise, force compute and record.
+                if not (math.isfinite(rel) and math.isfinite(rel_rescaled)):
+                    state.failsafe_count += 1
+                    force_compute = True
+                if not force_compute:
+                    branch_state.accum += float(rel_rescaled)
+                    branch_state.sum_rel += float(rel)
+                    branch_state.sum_rescaled += float(rel_rescaled)
+                    branch_state.count_rel += 1
+                    skip = branch_state.accum < float(state.thresh)
+
+            if skip and (branch_state.prev_residual is not None):
+                # Skip compute: add cached residual (shapes must match current x).
+                if branch_state.shape is not None and tuple(x.shape) == tuple(branch_state.shape):
+                    x = x + branch_state.prev_residual.to(x.device, x.dtype)
+                    branch_state.skipped += 1
+                else:
+                    # Fallback to compute if guard fails.
+                    state.failsafe_count += 1
+                    # Save "before" to compute a fresh residual after full compute.
+                    x_before = x
+                    for idx, block in enumerate(self.blocks):
+                        x = block(x, **kwargs)
+                        x = self.after_transformer_block(idx, x)
+                    # Cache a clean residual from this compute path.
+                    branch_state.prev_residual = (x - x_before).detach().to(x.dtype)
+                    branch_state.shape = tuple(x.shape)
+                    branch_state.accum = 0.0
+            else:
+                # Compute path: run all blocks and audio injections, then cache residual.
+                x_before = x
+                for idx, block in enumerate(self.blocks):
+                    x = block(x, **kwargs)
+                    x = self.after_transformer_block(idx, x)
+                branch_state.prev_residual = (x - x_before).detach().to(x.dtype)
+                branch_state.shape = tuple(x.shape)
+                branch_state.accum = 0.0
+
+            # Update signature and bookkeeping.
+            branch_state.prev_mod_sig = float(cur_sig)
+            branch_state.total += 1
 
         # Context Parallel
         if self.use_context_parallel:

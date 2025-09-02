@@ -1,10 +1,10 @@
 # TeaCache-Style Conditional Transformer Skipping for Wan2.2 (Phase 1)
 
-Status: Design only (pre-implementation)
+Status: Implemented (I2V, TI2V, S2V)
 
 Owners: video-inference
 
-Scope: I2V (A14B) and TI2V (5B) pipelines only. S2V is Phase 2.
+Scope: I2V (A14B), TI2V (5B), and S2V (14B) pipelines. S2V follows the same gating logic, adapted for segmented time modulation.
 
 Goals
 
@@ -13,10 +13,9 @@ Goals
 - Support the repo’s single-GPU and multi-GPU (FSDP and sequence-parallel/Ulysses) patterns, both UniPC and DPM++ samplers, and model offload.
 - Maintain inference-only posture — do not add training code.
 
-Non-Goals (Phase 1)
+Non-Goals
 
-- No S2V support (Phase 2 follow-up).
-- No model-specific polynomial calibration (default linear rescale; hook provided).
+- No model-specific polynomial calibration (default linear rescale; hook provided). Unknown policies fall back to `linear`.
 
 ---
 
@@ -34,13 +33,13 @@ We wrap the DiT block stack inside `WanModel` (used by I2V/TI2V) with a TeaCache
 
 5) When models are offloaded, store cached residuals on CPU and move them to GPU on use.
 
-Design is encapsulated in a small state object (`TeaCacheState`) and a util module. No changes are made to the internal math of blocks or attention.
+Design is encapsulated in a small state object (`TeaCacheState`) and a util module. No changes are made to the internal math of blocks or attention; compute path is unchanged when disabled.
 
 ---
 
 ## 2. API and Flags
 
-CLI (in `generate.py`):
+CLI (in `generate.py` → propagated into `cfg` → consumed by pipelines):
 
 - `--teacache` (bool, default: False) — enable TeaCache gating.
 - `--teacache_thresh` (float, default: 0.08) — accumulator threshold; larger → more skipping.
@@ -48,12 +47,12 @@ CLI (in `generate.py`):
 - `--teacache_warmup` (int, default: 1) — force compute for first K steps.
 - `--teacache_last_steps` (int, default: 1) — force compute for last K steps.
 
-Programmatic (on `WanModel`):
+Programmatic (on `WanModel`/`WanModel_S2V` instances; set by pipelines after schedulers are configured every run):
 
 - `model.enable_teacache: bool`
 - `model.teacache: TeaCacheState | None`
-  - Pipelines attach an initialized state object per model after sampling timesteps are known.
-  - Pipelines update `teacache.branch` to `cond` or `uncond` before each model call.
+  - Pipelines attach or refresh state each run after solver timesteps are known and call `reset(state)` (per‑run reset). Residuals/accumulators are cleared.
+  - Pipelines update `teacache.branch` to `cond` or `uncond` before each model call; step counter increments on `cond` only.
 
 ---
 
@@ -88,6 +87,8 @@ Helper functions (in `wan/utils/teacache.py`):
 - `rescale(rel: float, policy: str) -> float` — identity for `linear`. Hook for polynomials later.
 - `reset(state: TeaCacheState)` — zero accumulators, clear residuals/signatures.
 - `move_residual_to(residual, device, dtype) -> Tensor` — device/dtype management.
+  
+Telemetry fields (implemented): per-branch `total`, `skipped`, `sum_rel`, `sum_rescaled`, `count_rel`; global `failsafe_count`.
 
 ---
 
@@ -123,7 +124,7 @@ accum += rescaled
 
 6) Update `prev_mod_sig = cur_sig` (CPU scalar). CFG keeps separate branch states.
 
-Sequence-parallel: compute local `rel` (or `cur_sig`) per rank and AllReduce mean for a consistent decision. Residuals are sharded; addition is local.
+Sequence-parallel: compute local `rel` per rank and AllReduce mean for a consistent decision (SUM/mean); residuals are sharded and added locally.
 
 ---
 
@@ -131,7 +132,9 @@ Sequence-parallel: compute local `rel` (or `cur_sig`) per rank and AllReduce mea
 
 Devices & offload
 
-- Keep `prev_residual` on CPU when model is on CPU (offloaded). Before reuse, move residual to model’s device and cast to the model’s compute dtype.
+- Keep `prev_residual` on CPU when model is on CPU (offloaded). Before reuse, move residual to model’s device and cast to the model’s compute dtype (handled by `move_residual_to`).
+- I2V: when offloading the inactive expert or at end-of-run offload, cached residuals are explicitly moved to CPU to free VRAM.
+- TI2V/S2V: at end-of-run offload, cached residuals are explicitly moved to CPU.
 - `prev_mod_sig` always stored on CPU.
 - Shape/dtype guards prevent mismatched reuse.
 
@@ -142,7 +145,7 @@ FSDP
 
 Sequence-parallel (Ulysses)
 
-- Add a single scalar AllReduce per step (mean of local `rel` or `cur_sig` deltas) for consistent gating.
+- Add a single scalar AllReduce per step (mean of local `rel` deltas) for consistent gating. Applied only when SP is active.
 - Residual is per-rank shard; addition remains local and consistent.
 
 ---
@@ -151,7 +154,7 @@ Sequence-parallel (Ulysses)
 
 At runtime, force compute and reset the affected branch state when any of the following happen:
 
-- `prev_mod_sig` is None (first use), or `rel/rescaled` is NaN/Inf.
+- `prev_mod_sig` is None (first use of a branch), or `rel/rescaled` is NaN/Inf.
 - Residual shape/dtype mismatch with the current `x`.
 - In SP, anomaly detected (e.g., inconsistent world size or communication failure).
 - After an exception or device move failure (log once and continue computing).
@@ -160,7 +163,13 @@ Each fail-safe increments a counter; final telemetry reports counts.
 
 ---
 
-## 7. File-Level Change List (Pseudo-Snippets)
+## 7. Implementation Notes and Validation
+
+- Pipelines call `_attach_teacache_state(len(timesteps))` once per run after scheduler timesteps are known. This refreshes config and `reset(state)` to ensure no cross-run leakage.
+- Residual movement to CPU is performed during model offload (I2V inactive expert per-step, and end-of-run in I2V/TI2V/S2V).
+- S2V mirrors I2V/TI2V gating but computes the signature from segmented time modulation consistent with its block math.
+
+## 8. File-Level Change List (Pseudo-Snippets)
 
 New file: `wan/utils/teacache.py`
 
@@ -192,7 +201,7 @@ def reset(state: TeaCacheState) -> None: ...
 def move_residual_to(t: Tensor, device, dtype) -> Tensor: ...
 ```
 
-Modify: `wan/modules/model.py` (WanModel)
+Implemented: `wan/modules/model.py` (WanModel)
 
 ```
 # class WanModel:
@@ -225,7 +234,7 @@ def forward(...):
         # existing path: run blocks
 ```
 
-Modify: `wan/distributed/sequence_parallel.py`
+Implemented: `wan/distributed/sequence_parallel.py`
 
 ```
 def sp_dit_forward(model, ...):
@@ -237,26 +246,18 @@ def sp_dit_forward(model, ...):
     # then same skip/compute logic; residual stays sharded
 ```
 
-Modify: `wan/image2video.py`, `wan/textimage2video.py`
+Implemented: `wan/image2video.py`, `wan/textimage2video.py`
 
 ```
-# argparse additions:
-parser.add_argument('--teacache', action='store_true', default=False)
-parser.add_argument('--teacache_thresh', type=float, default=0.08)
-parser.add_argument('--teacache_policy', type=str, default='linear')
-parser.add_argument('--teacache_warmup', type=int, default=1)
-parser.add_argument('--teacache_last_steps', type=int, default=1)
+CLI flags are added in `generate.py` and copied into `cfg` so that pipelines can set `enable_teacache` and attach a `TeaCacheState` after `timesteps` are known. Pipelines switch `branch` to `cond` and increment `cnt` once per diffusion step, then switch to `uncond` for the second pass.
 
-# after sampling_steps known and models created:
-state = TeaCacheState(enabled=args.teacache, num_steps=sampling_steps,
-                      thresh=args.teacache_thresh, policy=args.teacache_policy,
-                      warmup=args.teacache_warmup, last_steps=args.teacache_last_steps)
-wan_model.enable_teacache = args.teacache
-wan_model.teacache = state
+I2V specifics:
+- Two experts (low/high) each get an independent `TeaCacheState` on both wrapper and inner (FSDP) module; inactive expert residuals are moved to CPU on offload.
 
-# in step loop:
-model.teacache.branch = 'cond'; noise_pred_cond = model(...)
-model.teacache.branch = 'uncond'; noise_pred_uncond = model(...)
+TI2V specifics:
+- Single backbone gets an attached `TeaCacheState` on wrapper and inner (FSDP) module.
+
+End-of-run telemetry is logged on rank 0 (skip rates, average rel/rescaled, failsafes).
 ```
 
 Modify: `generate.py` — add CLI flags; no behavioral change otherwise.
@@ -400,4 +401,3 @@ Rollback:
 - Functional parity when disabled; no change to outputs.
 - With TeaCache enabled at conservative threshold, 1.3–1.5× speedup at 480p/720p with minor perceptual differences.
 - Works in SP + FSDP + offload without runtime errors; telemetry reports sensible skip rates.
-

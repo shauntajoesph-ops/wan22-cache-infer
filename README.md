@@ -1,283 +1,180 @@
-# Wan2.2 Inference (Cache‑Optimized)
+# Wan2.2 Inference · Cache Acceleration
 
-This repository provides an inference‑only implementation of Wan2.2 pipelines with an integrated cache system that accelerates generation without changing quality. It targets practical, efficient deployment of:
-
-- i2v‑A14B (Image‑to‑Video)
-- ti2v‑5B (Text‑Image‑to‑Video)
-- s2v‑14B (Speech‑to‑Video)
-
-Text‑to‑Video (T2V) is no longer supported in this codebase. For T2V, please use the official Diffusers integrations.
+This repo is based on Wan2.2 (https://github.com/Wan-Video/Wan2.2) and adds inference caches for acceleration (TeaCache, FBCache, CFG). Supported tasks: Image‑to‑Video, Text‑Image‑to‑Video, Speech‑to‑Video(No Text-to-Video).
 
 
-## Why This Repo
-
-- Identical generation quality: Caches are indicator‑only and never alter final math when a compute path is required. If a gate is unsafe, compute is forced.
-- Lower latency and VRAM: Conditional skipping reduces transformer work; optional CPU offload keeps peak memory down on single‑GPU.
-- Unified Cache Manager: One mechanism governs TeaCache, FBCache, and CFG cache with a single set of flags and consistent telemetry.
-- Inference‑only surfaces: Training is disabled by default to keep the code small, safe, and focused.
+Same Wan2.2 pipelines with cache‑assisted acceleration. At conservative defaults, quality parity is typically maintained, but you should validate with your workloads. A unified Cache Manager governs TeaCache, FBCache, and CFG reuse, working on single GPU (optional offload) and scaling to multi‑GPU (FSDP + Ulysses SP).
 
 
-## Installation
-
-- OS: Ubuntu 20.04/22.04 (x86_64) or compatible Linux.
-- Python: 3.10.x.
-- NVIDIA Driver: 535+ (CUDA 12.x runtime); verify with `nvidia-smi`.
-- GPU: Ampere (SM80, e.g., A100/3090) or newer recommended for Flash‑Attention. Hopper (H100) supported. Older GPUs can run without flash_attn.
-- System tools: `ffmpeg` for video muxing (`sudo apt-get install -y ffmpeg`).
-
-Recommended pinned dependencies (constraints for reproducibility):
-
-```txt
-torch==2.4.0
-torchvision==0.19.0
-diffusers==0.31.0
-transformers==4.49.0
-tokenizers==0.20.3
-accelerate==1.1.1
-opencv-python==4.9.0.80
-imageio==2.34.1
-imageio-ffmpeg==0.4.9
-easydict==1.10
-ftfy==6.2.0
-numpy==1.26.4
-# Optional but recommended on Ampere/Hopper
-flash-attn>=2.5.0
-```
-
-Install (use a clean virtualenv/conda):
-
-```bash
-pip install -r requirements.txt  # or: pip install .
-# dev tools (optional)
-pip install .[dev]
-```
-
-GPU VRAM guidance (single GPU):
-- I2V‑A14B: ≥ 80 GB recommended. Use multi‑GPU (FSDP+SP) or `--offload_model True` on smaller cards.
-- TI2V‑5B: ≥ 24 GB for text‑only; add `--offload_model True --t5_cpu` on 24 GB.
-- S2V‑14B: ≥ 80 GB recommended; `--infer_frames` reduces memory.
-
-Models: download weights from Hugging Face or ModelScope and point `--ckpt_dir` at the local folder, e.g.:
-
-- Wan2.2‑I2V‑A14B  →  `./Wan2.2-I2V-A14B`
-- Wan2.2‑TI2V‑5B   →  `./Wan2.2-TI2V-5B`
-- Wan2.2‑S2V‑14B   →  `./Wan2.2-S2V-14B`
+Note: pure Text‑to‑Video (T2V) is not included in this fork.
 
 
-## Model Download
+WARNING
+- Cache features can slightly degrade generation quality at aggressive thresholds; validate quality on your data before production.
+- Caches add residual buffers that may increase VRAM/RAM usage (especially with separate CFG branches and per‑expert models).
 
-Sources:
-- Hugging Face: `huggingface-cli download Wan-AI/<MODEL_NAME> --local-dir <TARGET_DIR>`
-- ModelScope: `modelscope download Wan-AI/<MODEL_NAME> --local_dir <TARGET_DIR>`
-
-Integrity (optional but recommended):
-```bash
-find <TARGET_DIR> -type f -maxdepth 1 -print0 | xargs -0 sha256sum > checksums.txt
-# Compare against published checksums or keep for provenance
-```
-
-Expected folder layouts:
-
-- I2V‑A14B (`./Wan2.2-I2V-A14B`)
-```
-Wan2.2-I2V-A14B/
-├─ models_t5_umt5-xxl-enc-bf16.pth
-├─ Wan2.1_VAE.pth
-├─ low_noise_model/      # diffusers-style weights (config + *.safetensors)
-└─ high_noise_model/     # diffusers-style weights
-```
-
-- TI2V‑5B (`./Wan2.2-TI2V-5B`)
-```
-Wan2.2-TI2V-5B/
-├─ models_t5_umt5-xxl-enc-bf16.pth
-├─ Wan2.2_VAE.pth
-└─ model files at root   # diffusers-style weights (model_index.json, *.safetensors)
-```
-
-- S2V‑14B (`./Wan2.2-S2V-14B`)
-```
-Wan2.2-S2V-14B/
-├─ models_t5_umt5-xxl-enc-bf16.pth
-├─ Wan2.1_VAE.pth
-├─ wav2vec2-large-xlsr-53-english/   # HF wav2vec2 directory
-└─ model files at root               # diffusers-style weights
-```
-
-
-## Quickstart
-
-Below are minimal commands. For more options (FSDP, Ulysses, offload, cache flags), see the sections after this.
-
-- Single‑GPU I2V
-```bash
-python generate.py \
-  --task i2v-A14B \
-  --size 1280*720 \
-  --ckpt_dir ./Wan2.2-I2V-A14B \
-  --image examples/i2v_input.JPG \
-  --prompt "A cinematic close-up of a playful cat at the beach."
-```
-
-- Multi‑GPU I2V (FSDP + Ulysses)
-```bash
-torchrun --nproc_per_node=8 generate.py \
-  --task i2v-A14B \
-  --size 1280*720 \
-  --ckpt_dir ./Wan2.2-I2V-A14B \
-  --image examples/i2v_input.JPG \
-  --dit_fsdp --t5_fsdp --ulysses_size 8
-```
-
-- Single‑GPU TI2V (text‑only)
-```bash
-python generate.py \
-  --task ti2v-5B \
-  --size 1280*704 \
-  --ckpt_dir ./Wan2.2-TI2V-5B \
-  --prompt "Two anthropomorphic cats boxing on a spotlighted stage."
-```
-
-- Single‑GPU TI2V (with image)
-```bash
-python generate.py \
-  --task ti2v-5B \
-  --size 1280*704 \
-  --ckpt_dir ./Wan2.2-TI2V-5B \
-  --image examples/i2v_input.JPG \
-  --prompt "A serene seaside scene; maintain subject identity."
-```
-
-- Single‑GPU S2V
-```bash
-python generate.py \
-  --task s2v-14B \
-  --size 1024*704 \
-  --ckpt_dir ./Wan2.2-S2V-14B \
-  --image examples/i2v_input.JPG \
-  --audio examples/talk.wav \
-  --prompt "A person calmly narrating a scene."
-```
 
 
 ## Cache Manager (TeaCache · FBCache · CFG)
 
-This repo includes a unified cache manager that coordinates TeaCache, FBCache, and CFG cache. It provides a shared lifecycle, a single set of flags, and clear telemetry. Caches are indicator‑only gates; when a gate is unsafe, the code falls back to compute.
+Design (first‑mode‑wins: FBCache → TeaCache → Compute):
 
-- Priority: FBCache → TeaCache → Compute (first eligible skip wins)
-- Lifecycle: warmup → main → last‑steps, applied to the cond branch; uncond shares the same timestep index
-- Distributed: scalar metrics are all‑reduced (mean) across ranks in Ulysses/SP mode
-- Offload: cached residuals move with the model when offloading to/from CPU
-- Telemetry: printed on rank 0 at the end of a run, per expert (I2V/TI2V) or per model (S2V)
+```
+Inputs (Prompt / Image / Audio)
+          │
+    Encoders (T5 / Vision / Audio)
+          │
+          v
+        DiT Step (t)
+          │
+   [Block 0]
+      │   └─> mod_inp / x_after_b0 ──┐  (signals)
+      v                               │
+   [Blocks 1..N]                      │
+      │                               │
+      v                               │
+   hidden/residuals  <──────────────┐ │  (cached full‑stack residuals)
+                                     │ │
+   +----------- Cache Manager -------------------------------+
+   |  FBCache (within‑step, first‑block metric)              |
+   |   • compute rel from mod_inp or residual (b0)          |
+   |   • SP all‑reduce(mean) if SP>1                        |
+   |   • if rescaled_acc < fb_thresh → SKIP rest of stack   |
+   |                                                        |
+   |  TeaCache (across‑steps)                               |
+   |   • rel vs prev‑step signature                         |
+   |   • SP all‑reduce(mean) if SP>1                        |
+   |   • if rescaled_acc < tc_thresh → SKIP at step t       |
+   |                                                        |
+   |  CFG reuse (within‑step)                               |
+   |   • cond decision/metric authoritative for uncond      |
+   |                                                        |
+   |  Offload moves · Fail‑safes · Telemetry                |
+   +--------------------------+-----------------------------+
+                              │
+                    decision: SKIP/COMPUTE
+                              │
+    if SKIP: apply cached residuals (resume_from_block=1 for FB)
+                              │
+                              v
+                        VAE Decode → Video
+```
 
-Expected effects (typical):
-- 1.3×–2.0× speedups depending on threshold and content
-- Identical generation quality; skips reuse cached residuals conservatively and force compute on shape/dtype mismatches or invalid metrics
 
-### TeaCache flags
-Enable conditional transformer skipping based on modulated hidden dynamics.
+- Distributed (SP/Ulysses): fp32 all‑reduce (mean) of scalar metrics across ranks; if reduction fails, use local metric and record a failsafe.
+- Offload: cached residuals move with the model on CPU↔GPU transitions; shape/dtype mismatches force compute and increment failsafe count.
+- Telemetry: per‑branch totals/skips/avg rel/avg rescaled, global failsafe count, and pair stats; printed once on rank 0 at end of run.
+- Fail‑safes (compute is forced): invalid metrics (NaN/Inf), reduce errors, shape/dtype mismatch, missing/OOM residual moves, lifecycle guards, or pair‑consistency issues in separate‑CFG mode.
 
-- `--teacache`: enable (default off)
-- `--teacache_thresh`: skip aggressiveness (default 0.08; lower is more conservative)
-- `--teacache_policy`: rescale policy (`linear` default; unknown values fallback to `linear`)
-- `--teacache_warmup`: force compute first K executed cond steps (default 1)
-- `--teacache_last_steps`: force compute last K executed cond steps (default 1)
-- `--teacache_alternating`: alternate skip eligibility to stabilize long reuse sequences (default off)
 
-Example:
+## Cache Principles & Implementations
+
+### TeaCache
+- Principle: Across‑step gating based on stability of hidden dynamics. If the step‑to‑step signature change is small, reuse the previous step’s residuals.
+- What is cached: Full‑stack residuals for the DiT step (cond branch; uncond follows cond action).
+- Decision signal: Signature of normalized, time‑modulated input to the first self‑attention block; relative change vs previous step; rescaled via `--teacache_policy` (default: linear/identity).
+- Scope: Across steps (within the DiT forward for the cond branch); uncond reuses cond action within the same step.
+- Expected speedup: ~1.4–2.2× (content/threshold dependent).
+- Memory/quality trade‑offs: Adds per‑branch residual buffers; aggressive thresholds can cause detail staleness or motion jitter. Use `--teacache_warmup/--teacache_last_steps` and optionally `--teacache_alternating` to stabilize long reuse runs.
+- Compatibility: SP/Ulysses uses fp32 mean for scalar metrics; FSDP supported (attach after wrapping); Offload supported (residuals move with model); MoE/expert models supported with per‑expert telemetry.
+- Enable flags & defaults: `--teacache` (off), `--teacache_thresh 0.08`, `--teacache_policy linear`, `--teacache_warmup 1`, `--teacache_last_steps 1`, `--teacache_alternating` (off).
+
+- What: Conditional transformer skipping; when hidden/residual dynamics are stable, reuse cached residuals instead of recomputing all layers.
+- Where: Across sampling steps within the DiT block(s) for the cond branch; uncond follows cond decisions.
+- Speedup: ~1.4–2.2× in typical tests (threshold‑dependent).
+
+
+### FBCache
+- Principle: Indicator‑only gate using an early (block‑0) metric to decide whether to skip the rest of the stack for the current step and reuse cached residuals.
+- What is cached: Full‑stack residuals for the current step (resume from block‑0 when skipping).
+- Decision signal: `--fb_metric` on block‑0 inputs/outputs (`hidden_rel_l1`, `hidden_rel_l2`, or `residual_rel_l1`); optional `--fb_downsample` stride and `--fb_ema` smoothing; rescaled and accumulated vs threshold.
+- Scope: Within‑step (first‑block gate) for each timestep.
+- Expected speedup: ~1.2–1.6× (metric/threshold dependent).
+- Memory/quality trade‑offs: Adds residual buffers; at aggressive thresholds, can under‑react to rapid changes and cause subtle artifacts. EMA and warmup/last‑steps mitigate thrashing; defaults are conservative.
+- Compatibility: SP/Ulysses scalar mean; FSDP supported; Offload supported; MoE/expert models supported per expert. `--fb_cfg_sep_diff` allows uncond metric to be computed separately while cond action remains authoritative unless a hard failsafe requires compute.
+- Enable flags & defaults: `--fbcache` (off), `--fb_thresh 0.08`, `--fb_metric hidden_rel_l1|hidden_rel_l2|residual_rel_l1` (default hidden_rel_l1), `--fb_downsample 1`, `--fb_ema 0.0`, `--fb_warmup 1`, `--fb_last_steps 1`, `--fb_cfg_sep_diff true`.
+- What: First‑block indicator gating; compute a lightweight metric on the first block, then reuse cached residuals for the rest of the step if changes are small.
+
+- Where: First transformer block each step (indicator‑only); affects the whole step.
+- Speedup: ~1.2–1.6× in typical tests (metric/threshold dependent).
+ - Extra: `--fb_cfg_sep_diff` lets uncond compute its own metric; cond action remains authoritative unless a hard failsafe requires compute.
+
+
+### CFG Cache
+- Principle: Cond‑authoritative pair policy. Within a timestep, reuse the cond branch’s metric and decision for uncond to keep CFG pairs consistent and avoid duplicate gating work.
+- What is cached: Last cond rescaled metric(s) and action for the current step; uncond may compute its own metric when `--fb_cfg_sep_diff=true` but still follows cond action unless a hard failsafe applies.
+- Decision signal: Cond branch rescaled metric and action; optional separate metric for uncond if `--fb_cfg_sep_diff=true`.
+- Scope: Within‑step (cond → uncond) only.
+- Expected speedup: ~1.1–1.7× depending on CFG strength and content.
+- Memory/quality trade‑offs: Minimal; prioritizes pair consistency. Uncond can be forced to compute if residuals are missing or guards trigger.
+- Compatibility: Works with SP/FSDP/offload; decisions remain consistent across ranks via cond‑authoritative action.
+- Enable flags & defaults: Enabled by design (no separate CLI flag). Pair behavior can be adjusted via `--fb_cfg_sep_diff` (default true).
+
+- What: Reuse cond branch decision/metrics for the uncond branch within a timestep (cond‑authoritative) to keep pairs consistent.
+- Where: Within‑step (cond → uncond) only; separate‑CFG pipelines use cond as the authority.
+- Speedup: ~1.1–1.7× depending on CFG strength and content.
+
+
+## Quick Start
+
+Install:
 ```bash
-python generate.py --task i2v-A14B --size 832*480 --ckpt_dir ./Wan2.2-I2V-A14B \
+pip install .            # add: pip install .[dev]  (optional)
+```
+
+Single‑GPU examples:
+```bash
+# I2V (TeaCache)
+python generate.py --task i2v-A14B --size 1280*720 \
+  --ckpt_dir ./Wan2.2-I2V-A14B \
   --image examples/i2v_input.JPG \
+  --teacache --teacache_thresh 0.08
+
+# TI2V (FBCache)
+python generate.py --task ti2v-5B --size 1280*704 \
+  --ckpt_dir ./Wan2.2-TI2V-5B \
+  --prompt "Two anthropomorphic cats boxing on a spotlighted stage." \
+  --fbcache --fb_thresh 0.10
+
+# S2V (TeaCache)
+python generate.py --task s2v-14B --size 1024*704 \
+  --ckpt_dir ./Wan2.2-S2V-14B \
+  --image examples/i2v_input.JPG \
+  --audio examples/talk.wav \
   --teacache --teacache_thresh 0.08
 ```
 
-### FBCache flags
-Enable first‑block cache using early hidden/residual metrics (indicator‑only).
-
-- `--fbcache`: enable (default off)
-- `--fb_thresh`: rescaled metric threshold for skip (default 0.08)
-- `--fb_metric`: metric type (`hidden_rel_l1` default; `residual_rel_l1`, `hidden_rel_l2` optional)
-- `--fb_downsample`: stride for metric computation over tokens (default 1)
-- `--fb_ema`: EMA factor [0,1) for smoothing the metric (default 0 → off)
-- `--fb_warmup`: force compute first K executed cond steps (default 1)
-- `--fb_last_steps`: force compute last K executed cond steps (default 1)
-- `--fb_cfg_sep_diff`: compute CFG and non‑CFG diffs separately (default true)
-
-Example:
+Multi‑GPU (FSDP + Ulysses/SP):
 ```bash
-python generate.py --task ti2v-5B --size 1280*704 --ckpt_dir ./Wan2.2-TI2V-5B \
-  --fbcache --fb_thresh 0.08
+torchrun --nproc_per_node=8 generate.py \
+  --task i2v-A14B --size 1280*720 \
+  --ckpt_dir ./Wan2.2-I2V-A14B \
+  --image examples/i2v_input.JPG \
+  --dit_fsdp --t5_fsdp --ulysses_size 8 \
+  --teacache --teacache_thresh 0.08
+```
+
+Examples & Flags:
+- TeaCache: `--teacache --teacache_thresh 0.08 [--teacache_policy linear --teacache_warmup 1 --teacache_last_steps 1 --teacache_alternating]`
+- FBCache: `--fbcache --fb_thresh 0.10 [--fb_metric hidden_rel_l1 --fb_downsample 1 --fb_ema 0 --fb_warmup 1 --fb_last_steps 1 --fb_cfg_sep_diff true]`
+- CFG reuse: on by default in separate‑CFG pipelines; no flag required.
+- Combining: you can pass both, but FBCache takes precedence by design.
+
+Combined example (FBCache + TeaCache; FBCache wins):
+```bash
+python generate.py --task i2v-A14B --size 1280*720 \
+  --ckpt_dir ./Wan2.2-I2V-A14B \
+  --image examples/i2v_input.JPG \
+  --fbcache --fb_thresh 0.10 \
+  --teacache --teacache_thresh 0.08
 ```
 
 Notes:
-- Prefer enabling one of TeaCache or FBCache at a time. If both are set, FBCache takes precedence.
-- On shape/dtype mismatch or invalid metrics, compute is forced and accumulators reset (failsafe).
+- Single GPU: you may add `--offload_model True` to reduce peak VRAM.
+- Multi‑GPU: offload is auto‑disabled; keep `--ulysses_size` equal to world size.
 
-### CFG cache
-- Cond‑authoritative by default: reuse cond branch metrics/action for uncond within a step (aligns with separate‑CFG pipelines in Wan2.2).
-- Controlled inside the Cache Manager; no extra CLI flag required. When `--fb_cfg_sep_diff=true`, FBCache can evaluate CFG and non‑CFG diffs separately but still respects cond action unless a hard failsafe triggers.
-
-### Telemetry
-- End‑of‑run summary lines like:
-  - `CacheManager[low] summary: ...`
-  - `CacheManager[high] summary: ...`
-  - or a single `CacheManager[...] summary` for S2V
-- Includes per‑branch totals/skips/averages and failsafe counts.
-
-
-## Performance Tips
-- Single GPU: `--offload_model True` can reduce peak VRAM (slower but fits bigger sizes).
-- Multi‑GPU: prefer `--dit_fsdp --t5_fsdp --ulysses_size <num_ranks>`; offload is typically unnecessary.
-- Data types: `--convert_model_dtype` casts DiT params to bf16/fp16 when not using FSDP.
-- Set `WAN_INFERENCE_ONLY=1` (default) to keep autograd disabled and avoid accidental training calls.
-
-
-## Notes on Scope
-- This is an inference‑only library. Training APIs are disabled by default; set `WAN_INFERENCE_ONLY=0` to bypass at your own risk.
-- T2V (Text‑to‑Video) was removed from this codebase. Use the official Diffusers pipelines for T2V.
-
-
-## MoE Architecture (I2V‑A14B)
-
-I2V‑A14B uses a Mixture‑of‑Experts backbone with two experts: a high‑noise expert for early (noisy) steps and a low‑noise expert for late (clean) steps. Switching is deterministic and based on the global denoising step index.
-
-- Experts: `high_noise_model` and `low_noise_model` are loaded and swapped per step.
-- Boundary: `boundary_step = boundary * num_train_timesteps` (from config). For step `t`:
-  - if `t >= boundary_step` → use high‑noise expert
-  - else → use low‑noise expert
-- Offload: when `--offload_model True`, the inactive expert is moved to CPU to reduce VRAM; cached residuals are moved alongside to keep device state consistent.
-
-This scheme preserves quality while allowing memory‑efficient runs in single‑GPU and multi‑GPU settings.
-
-
-## Benchmarks (Reproducible)
-
-We include bash scripts to measure end‑to‑end wallclock time and verify cache telemetry.
-
-- TeaCache smoke tests: `bash tests/test_teacache.sh <models_root> [gpus]`
-- Quick smoke (I2V/TI2V/S2V): `bash tests/test_cache_smoke.sh <models_root>`
-- TeaCache benchmark: `bash benchmarks/bench_teacache.sh <models_root>`
-
-Methodology:
-- Fixed seeds (`--base_seed 42`) and fixed prompts/images to ensure repeatability.
-- Measure wallclock with `/usr/bin/time` and extract VRAM via `nvidia-smi --query-gpu=memory.used` during peak sections.
-- Run two variants per task: baseline (no cache) vs cache enabled (`--teacache --teacache_thresh 0.08` or `--fbcache --fb_thresh 0.08`).
-
-What to expect (typical):
-
-| Task     | Resolution    | Cache     | Speedup vs. baseline | Peak VRAM impact |
-|----------|---------------|-----------|-----------------------|------------------|
-| I2V‑A14B | 832×480       | TeaCache  | 1.3×–2.0×            | Neutral/slightly lower |
-| TI2V‑5B  | 1280×704      | TeaCache  | 1.3×–2.0×            | Neutral/slightly lower |
-| S2V‑14B  | 1024×704      | TeaCache  | 1.3×–2.0×            | Neutral/slightly lower |
-
-Notes:
-- Actual numbers depend on content, hardware, and thresholds.
-- FBCache provides similar ranges and may work better on some prompts; enable either TeaCache or FBCache (FBCache wins if both set).
-
-## License
-Apache 2.0. See `LICENSE.txt`.
-
-
-## Acknowledgements
-Thanks to contributors and upstream projects including Diffusers, Qwen, and the broader Wan community.
+## Model Download https://github.com/Wan-Video/Wan2.2#model-download
+- Download official Wan2.2 weights from the upstream release and keep them locally.
+- Create per‑task folders you will pass to `--ckpt_dir`, e.g. `./Wan2.2-I2V-A14B`, `./Wan2.2-TI2V-5B`, `./Wan2.2-S2V-14B`.
+- Each folder contains the VAE `.pth`, the T5 encoder weights, and DiT weights as released upstream (diffusers‑style files).
+- (Optional) Verify integrity: `find <dir> -maxdepth 1 -type f -print0 | xargs -0 shasum -a 256 > checksums.txt`.

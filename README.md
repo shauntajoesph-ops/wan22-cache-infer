@@ -178,3 +178,38 @@ Notes:
 - Create per‑task folders you will pass to `--ckpt_dir`, e.g. `./Wan2.2-I2V-A14B`, `./Wan2.2-TI2V-5B`, `./Wan2.2-S2V-14B`.
 - Each folder contains the VAE `.pth`, the T5 encoder weights, and DiT weights as released upstream (diffusers‑style files).
 - (Optional) Verify integrity: `find <dir> -maxdepth 1 -type f -print0 | xargs -0 shasum -a 256 > checksums.txt`.
+
+## Compiled Run Script (torch.compile + CUDA Graphs)
+
+- Path: `scripts/run_compiled.sh`
+
+Prerequisites (minimum recommended):
+- OS: Linux x86_64; Python 3.10+; PyTorch ≥ 2.4.0.
+- NVIDIA: Driver ≥ 535 (CUDA 12.x), recent GPU (Ampere/Hopper recommended).
+- Workload: Prefer static shapes and fixed batch for best CUDA Graphs results.
+
+Usage:
+```bash
+# Basic
+scripts/run_compiled.sh -- <your_script.py> [script args...]
+
+# Common options (condensed)
+#   --python PATH       # override interpreter (default: python)
+#   --mode MODE         # reduce-overhead | max-autotune | default
+#   --no-cudagraphs     # do not request CUDA Graphs
+#   --connections N
+#   --alloc-conf STR
+#   --logs +dynamo,+inductor
+
+# Example: compile+graphs for I2V
+scripts/run_compiled.sh --mode reduce-overhead -- \
+  generate.py --task i2v-A14B --size 1280*720 \
+  --ckpt_dir ./Wan2.2-I2V-A14B \
+  --image examples/i2v_input.JPG
+```
+
+What it sets:
+- `TORCH_COMPILE=1`, `TORCH_COMPILE_MODE=<mode>`
+- `TORCHINDUCTOR_USE_CUDAGRAPHS=1` (unless `--no-cudagraphs`)
+- `CUDA_DEVICE_MAX_CONNECTIONS`, `PYTORCH_CUDA_ALLOC_CONF`
+- Optional: `TORCH_LOGS` for Dynamo/Inductor diagnostics

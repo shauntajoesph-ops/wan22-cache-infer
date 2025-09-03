@@ -2,15 +2,64 @@
 
 ## Project Structure & Module Organization
 - Source: `wan/` — core models under `wan/modules/` (attention, tokenizers, VAE, S2V), configs in `wan/configs/`, utilities in `wan/utils/`, distributed helpers in `wan/distributed/`.
-- Entry points: `generate.py` (main CLI), plus task helpers (`wan/text2video.py`, `wan/image2video.py`, `wan/speech2video.py`, `wan/textimage2video.py`).
+- Entry points: `generate.py` (main CLI), plus task helpers (`wan/image2video.py`, `wan/speech2video.py`, `wan/textimage2video.py`).
 - Assets & examples: images in `assets/`, sample inputs in `examples/`.
 - Tooling: `pyproject.toml`, `requirements.txt`, `Makefile`, and tests in `tests/` (see `tests/test.sh`).
 
 ## Build, Test, and Development Commands
 - Install: `pip install .` and `pip install .[dev]` (or `poetry install`).
-- Run (single GPU): `python generate.py --task t2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-T2V-A14B --prompt "..."`.
+- Run (single GPU): `python generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B --prompt "..."`.
 - Run (multi‑GPU): `torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B --dit_fsdp --t5_fsdp --ulysses_size 8`.
+- TeaCache (I2V/TI2V/S2V): add `--teacache --teacache_thresh 0.08` to enable conditional transformer skipping for speedups (~1.3–2.0x depending on threshold). Examples:
+  - Single GPU TI2V: `python generate.py --task ti2v-5B --size 1280*704 --ckpt_dir ./Wan2.2-TI2V-5B --teacache --teacache_thresh 0.08`
+  - Multi-GPU I2V: `torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B --dit_fsdp --t5_fsdp --ulysses_size 8 --teacache --teacache_thresh 0.08`
+  - Single GPU S2V: `python generate.py --task s2v-14B --ckpt_dir ./Wan2.2-S2V-14B --image examples/i2v_input.JPG --audio examples/talk.wav --teacache --teacache_thresh 0.08`
+- FBCache (I2V/TI2V/S2V): add `--fbcache --fb_thresh 0.08` to enable First‑Block Cache (indicator‑only) for speedups in a similar range. Examples:
+  - Single GPU TI2V: `python generate.py --task ti2v-5B --size 1280*704 --ckpt_dir ./Wan2.2-TI2V-5B --fbcache --fb_thresh 0.08`
+  - Multi-GPU I2V: `torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B --dit_fsdp --t5_fsdp --ulysses_size 8 --fbcache --fb_thresh 0.08`
+  - Single GPU S2V: `python generate.py --task s2v-14B --ckpt_dir ./Wan2.2-S2V-14B --image examples/i2v_input.JPG --audio examples/talk.wav --fbcache --fb_thresh 0.08`
+  - TeaCache flags:
+    - `--teacache`: enable (disabled by default)
+    - `--teacache_thresh`: skip aggressiveness (default 0.08)
+    - `--teacache_policy`: rescale policy (`linear` default; unknown values fall back to `linear`)
+    - `--teacache_warmup`: force compute first K steps (default 1)
+    - `--teacache_last_steps`: force compute last K steps (default 1)
+    - `--teacache_alternating`: alternate skip eligibility (default off). Helps stabilize long sequences of reuses.
+    - Design doc: see [CFG_CACHE_DESIGN.md](CFG_CACHE_DESIGN.md) for architecture and details.
+  - FBCache flags:
+    - `--fbcache`: enable (disabled by default)
+    - `--fb_thresh`: threshold for the (rescaled) gating metric (default 0.08)
+    - `--fb_metric`: metric type (`hidden_rel_l1` default; `residual_rel_l1`, `hidden_rel_l2` optional)
+    - `--fb_downsample`: stride for metric computation over tokens (default 1)
+    - `--fb_ema`: EMA factor [0,1) for smoothing the metric (default 0 → off)
+    - `--fb_warmup`: force compute first K steps (default 1)
+    - `--fb_last_steps`: force compute last K steps (default 1)
+    - `--fb_cfg_sep_diff`: compute CFG and non‑CFG diffs separately (default true)
+    - Design doc: see [FB_CACHE.md](FB_CACHE.md) for full design, thresholds, and presets.
+  - Notes and caveats:
+    - State resets per run; cached residuals are cleared before each generation.
+    - In SP/Ulysses mode, ranks synchronize a scalar decision each step; ensure ranks are aligned.
+    - On shape/dtype mismatch or invalid metrics, compute is forced (failsafe) and accumulator resets.
+    - Offload mode moves cached residuals to CPU when models are offloaded to release VRAM (I2V/TI2V/S2V).
+    - In separate‑CFG pipelines (Wan2.2), the cond branch increments the executed step; warmup/last‑steps apply to cond; uncond shares the same timestep index.
+    - TeaCache vs FBCache: prefer enabling one at a time. If both are set, FBCache takes precedence in the current implementation to avoid conflicting gates.
+
+## Unified Cache Manager (TeaCache · FBCache · CFG)
+- Overview: A single Cache Manager governs TeaCache, FBCache, and CFG cache with a unified lifecycle, priority, distributed sync, offload moves, and telemetry.
+- Minimal flags (CLI → config):
+  - TeaCache: `--teacache`, `--teacache_thresh`, `--teacache_policy`, `--teacache_warmup`, `--teacache_last_steps`.
+  - FBCache: `--fbcache`, `--fb_thresh`, `--fb_metric` (`hidden_rel_l1` | `residual_rel_l1` | `hidden_rel_l2`), `--fb_downsample`, `--fb_ema`, `--fb_warmup`, `--fb_last_steps`, `--fb_cfg_sep_diff`.
+  - CFG cache: cond‑authoritative by default (reuse cond metrics/action for uncond within a step); `cfg_sep_diff=false` default.
+- Priority: FBCache → TeaCache → Compute. First eligible skip wins.
+- Lifecycle: init → warmup → main → last‑steps → reset. Warmup/last‑steps apply to cond branch; uncond shares the same timestep index.
+- Distributed: In SP (Ulysses) mode, scalar gating metrics are fp32 all‑reduced (mean) across ranks; failures force local compute (failsafe).
+- Offload: Residuals move with the model; pipelines call manager move hooks on CPU↔GPU transitions to avoid stale device state.
+- Telemetry: End‑of‑run summary printed on rank 0 (per expert for I2V); includes per‑branch totals/skips/averages, pair stats, and failsafe count.
+- Migration: Legacy Tea/FBCache attach code may still exist for compatibility, but gating is managed by the Cache Manager in model forwards.
+
 - Tests (E2E): `bash tests/test.sh <local model dir> <gpu number>`.
+- TeaCache smoke tests: `bash tests/test_teacache.sh <local model dir> [gpu number]`.
+- TeaCache benchmarks: `bash benchmarks/bench_teacache.sh <local model dir>`.
 - Format: `make format` (isort + yapf) or `black . && isort .`.
 
 ## Coding Style & Naming Conventions
@@ -31,4 +80,3 @@
 ## Security & Configuration Tips
 - Do not commit model weights or personal tokens. Use env vars for APIs: `DASH_API_KEY` (and `DASH_API_URL` for intl). Add secrets via your shell, not code.
 - Large runs may require ≥80GB VRAM (single GPU); prefer FSDP + Ulysses for multi‑GPU.
-

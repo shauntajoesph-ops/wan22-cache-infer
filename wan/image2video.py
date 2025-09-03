@@ -23,12 +23,15 @@ from .distributed.util import get_world_size
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
+from .utils.teacache import TeaCacheState
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.fbcache import FBCacheState, reset as _fbcache_reset
+from .utils.cache_manager import CacheManager, CMConfig
 
 
 class WanI2V:
@@ -134,6 +137,177 @@ class WanI2V:
             self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
+        # TeaCache: will be attached per-model after sampling_steps is known.
+        self._teacache_cfg = None  # type: ignore
+        self._fbcache_cfg = None  # type: ignore
+
+    def _attach_teacache_state(self, timesteps_len: int):
+        """
+        Attach TeaCache state to both expert models (low/high noise).
+
+        Args:
+            timesteps_len: Number of denoising steps for this run.
+        """
+        # Refresh config each run
+        self._teacache_cfg = dict(
+            enabled=getattr(self.config, "teacache", False),
+            num_steps=timesteps_len,
+            thresh=getattr(self.config, "teacache_thresh", 0.08),
+            policy=str(getattr(self.config, "teacache_policy", "linear")).lower(),
+            warmup=getattr(self.config, "teacache_warmup", 1),
+            last_steps=getattr(self.config, "teacache_last_steps", 1),
+            alternating=bool(getattr(self.config, "teacache_alternating", False)),
+        )
+        from .utils.teacache import reset as _teacache_reset
+        for m in (self.low_noise_model, self.high_noise_model):
+            # Attach or refresh on wrapper
+            m.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+            if getattr(m, "teacache", None) is None:  # type: ignore[attr-defined]
+                m.teacache = TeaCacheState(  # type: ignore[attr-defined]
+                    enabled=bool(self._teacache_cfg["enabled"]),
+                    num_steps=int(self._teacache_cfg["num_steps"]),
+                    thresh=float(self._teacache_cfg["thresh"]),
+                    policy=str(self._teacache_cfg["policy"]),
+                    warmup=int(self._teacache_cfg["warmup"]),
+                    last_steps=int(self._teacache_cfg["last_steps"]),
+                    sp_world_size=get_world_size(),
+                )
+            else:
+                st = getattr(m, "teacache")  # type: ignore[attr-defined]
+                st.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+                st.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
+                st.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
+                st.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
+                st.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
+                st.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
+                st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+            # Alternating flag is attached at module-level to avoid polluting state schema.
+            setattr(m, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
+            _teacache_reset(getattr(m, "teacache"))  # type: ignore[arg-type]
+
+            # Attach or refresh on inner module if FSDP-wrapped
+            inner = getattr(m, "module", None)
+            if inner is not None:
+                inner.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+                if getattr(inner, "teacache", None) is None:  # type: ignore[attr-defined]
+                    inner.teacache = TeaCacheState(  # type: ignore[attr-defined]
+                        enabled=bool(self._teacache_cfg["enabled"]),
+                        num_steps=int(self._teacache_cfg["num_steps"]),
+                        thresh=float(self._teacache_cfg["thresh"]),
+                        policy=str(self._teacache_cfg["policy"]),
+                        warmup=int(self._teacache_cfg["warmup"]),
+                        last_steps=int(self._teacache_cfg["last_steps"]),
+                        sp_world_size=get_world_size(),
+                    )
+                else:
+                    st_in = getattr(inner, "teacache")  # type: ignore[attr-defined]
+                    st_in.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
+                    st_in.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
+                    st_in.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
+                    st_in.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
+                    st_in.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
+                    st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
+                    st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+                setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
+        _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
+
+    def _move_teacache_residual_to_cpu(self, model):
+        """If TeaCache is attached, move cached residuals to CPU to free VRAM.
+
+        Called when a model is offloaded to CPU; since residual is not a parameter,
+        `.to('cpu')` on the module will not move it automatically.
+        """
+        target = getattr(model, "module", model)
+        st = getattr(target, "teacache", None)
+        if not st:
+            return
+        for br in (st.cond, st.uncond):
+            if br.prev_residual is not None and br.prev_residual.device.type == 'cuda':
+                br.prev_residual = br.prev_residual.to('cpu')
+
+    def _log_teacache_stats(self):
+        """Log end-of-run TeaCache telemetry for both experts (rank 0 only)."""
+        for name, m in (("low", self.low_noise_model), ("high", self.high_noise_model)):
+            target = getattr(m, "module", m)
+            st = getattr(target, "teacache", None)
+            if not st or not getattr(target, "enable_teacache", False):
+                continue
+            c = st.cond
+            u = st.uncond
+            def rate(sk, tot):
+                return (100.0 * sk / tot) if tot else 0.0
+        logging.info(
+            f"TeaCache[{name}] skips: cond {c.skipped}/{c.total} ({rate(c.skipped,c.total):.1f}%), "
+            f"uncond {u.skipped}/{u.total} ({rate(u.skipped,u.total):.1f}%), "
+            f"avg rel {((c.sum_rel+u.sum_rel)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+            f"avg rescaled {((c.sum_rescaled+u.sum_rescaled)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+            f"failsafe {st.failsafe_count}")
+
+    def _attach_fbcache_state(self, timesteps_len: int):
+        """Attach or refresh FBCache state for both experts; reset per run.
+
+        Mirrors TeaCache lifecycle and flags, following FB_CACHE.md. This
+        function is a no-op if FBCache is disabled in the config.
+        """
+        self._fbcache_cfg = dict(
+            enabled=getattr(self.config, "fbcache", False),
+            num_steps=timesteps_len,
+            thresh=getattr(self.config, "fb_thresh", 0.08),
+            metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")).lower(),
+            downsample=int(getattr(self.config, "fb_downsample", 1)),
+            ema=float(getattr(self.config, "fb_ema", 0.0)),
+            warmup=int(getattr(self.config, "fb_warmup", 1)),
+            last_steps=int(getattr(self.config, "fb_last_steps", 1)),
+            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", True)),
+        )
+        # Attach to both experts and their inner modules (if wrapped)
+        for model in (self.low_noise_model, self.high_noise_model):
+            target = getattr(model, "module", model)
+            target.enable_fbcache = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+            if getattr(target, "fbcache", None) is None:  # type: ignore[attr-defined]
+                target.fbcache = FBCacheState(  # type: ignore[attr-defined]
+                    enabled=bool(self._fbcache_cfg["enabled"]),
+                    num_steps=int(self._fbcache_cfg["num_steps"]),
+                    thresh=float(self._fbcache_cfg["thresh"]),
+                    metric=str(self._fbcache_cfg["metric"]),
+                    downsample=int(self._fbcache_cfg["downsample"]),
+                    ema=float(self._fbcache_cfg["ema"]),
+                    warmup=int(self._fbcache_cfg["warmup"]),
+                    last_steps=int(self._fbcache_cfg["last_steps"]),
+                    cfg_sep_diff=bool(self._fbcache_cfg["cfg_sep_diff"]),
+                    sp_world_size=get_world_size(),
+                )
+            else:
+                st = getattr(target, "fbcache")  # type: ignore[attr-defined]
+                st.enabled = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
+                st.num_steps = int(self._fbcache_cfg["num_steps"])  # type: ignore[attr-defined]
+                st.thresh = float(self._fbcache_cfg["thresh"])  # type: ignore[attr-defined]
+                st.metric = str(self._fbcache_cfg["metric"])  # type: ignore[attr-defined]
+                st.downsample = int(self._fbcache_cfg["downsample"])  # type: ignore[attr-defined]
+                st.ema = float(self._fbcache_cfg["ema"])  # type: ignore[attr-defined]
+                st.warmup = int(self._fbcache_cfg["warmup"])  # type: ignore[attr-defined]
+                st.last_steps = int(self._fbcache_cfg["last_steps"])  # type: ignore[attr-defined]
+                st.cfg_sep_diff = bool(self._fbcache_cfg["cfg_sep_diff"])  # type: ignore[attr-defined]
+                st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
+            _fbcache_reset(getattr(target, "fbcache"))  # type: ignore[arg-type]
+
+    def _log_fbcache_stats(self):
+        """Log end-of-run FBCache telemetry for both experts (rank 0 only)."""
+        for name, m in (("low", self.low_noise_model), ("high", self.high_noise_model)):
+            target = getattr(m, "module", m)
+            st = getattr(target, "fbcache", None)
+            if not st or not getattr(target, "enable_fbcache", False):
+                continue
+            c = st.cond
+            u = st.uncond
+            def rate(sk, tot):
+                return (100.0 * sk / tot) if tot else 0.0
+            logging.info(
+                f"FBCache[{name}] skips: cond {c.skipped}/{c.total} ({rate(c.skipped,c.total):.1f}%), "
+                f"uncond {u.skipped}/{u.total} ({rate(u.skipped,u.total):.1f}%), "
+                f"avg rel {((c.sum_rel+u.sum_rel)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+                f"avg rescaled {((c.sum_rescaled+u.sum_rescaled)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
+                f"failsafe {st.failsafe_count}")
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -208,13 +382,17 @@ class WanI2V:
             offload_model_name = 'high_noise_model'
         # OPTIM: CPU offload of inactive expert; bring active expert on-demand.
         if offload_model or self.init_on_cpu:
-            if next(getattr(
-                    self,
-                    offload_model_name).parameters()).device.type == 'cuda':
+            # If offloading the inactive expert, also move its cached residuals to CPU.
+            if next(getattr(self, offload_model_name).parameters()).device.type == 'cuda':
                 getattr(self, offload_model_name).to('cpu')
-            if next(getattr(
-                    self,
-                    required_model_name).parameters()).device.type == 'cpu':
+                self._move_teacache_residual_to_cpu(getattr(self, offload_model_name))
+                # (Cache Manager) Move manager residuals to CPU alongside model
+                _target = getattr(getattr(self, offload_model_name), "module", getattr(self, offload_model_name))
+                _mgr = getattr(_target, "cache_manager", None)
+                if _mgr is not None:
+                    _mgr.move_cached_residuals_to(torch.device('cpu'))
+            # Bring the required expert to GPU if needed (residual moved on demand in forward).
+            if next(getattr(self, required_model_name).parameters()).device.type == 'cpu':
                 getattr(self, required_model_name).to(self.device)
         return getattr(self, required_model_name)
 
@@ -397,6 +575,30 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
+            # Attach legacy Tea/FBCache state (compat), then attach Cache Manager (preferred).
+            self._attach_teacache_state(len(timesteps))
+            self._attach_fbcache_state(len(timesteps))
+            mgr_cfg = CMConfig(
+                num_steps=int(len(timesteps)),
+                warmup=int(getattr(self.config, "teacache_warmup", 1)),
+                last_steps=int(getattr(self.config, "teacache_last_steps", 1)),
+                enable_tc=bool(getattr(self.config, "teacache", False)),
+                tc_thresh=float(getattr(self.config, "teacache_thresh", 0.08)),
+                tc_policy=str(getattr(self.config, "teacache_policy", "linear")),
+                enable_fb=bool(getattr(self.config, "fbcache", False)),
+                fb_thresh=float(getattr(self.config, "fb_thresh", 0.08)),
+                fb_metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")),
+                fb_downsample=int(getattr(self.config, "fb_downsample", 1)),
+                fb_ema=float(getattr(self.config, "fb_ema", 0.0)),
+                cfg_sep_diff=False,
+                evaluation_order=("fb", "tc"),
+                sp_world_size=self.sp_size,
+            )
+            for m in (self.low_noise_model, self.high_noise_model):
+                target = getattr(m, "module", m)
+                target.cache_manager = CacheManager(mgr_cfg)
+                target.cache_manager.attach(num_steps=len(timesteps), sp_world_size=self.sp_size)
+
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
@@ -408,10 +610,18 @@ class WanI2V:
                 sample_guide_scale = guide_scale[1] if t.item(
                 ) >= boundary else guide_scale[0]
 
+                # (CFG Cache) Branch=cond; manager enforces lifecycle
+                mgr_target = getattr(model, "module", model)
+                if getattr(mgr_target, "cache_manager", None) is not None:
+                    mgr_target.cache_manager.begin_step("cond")
+
                 noise_pred_cond = model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
+                # (CFG Cache) Branch=uncond; reuse cond decision when cfg_sep_diff=false
+                if getattr(mgr_target, "cache_manager", None) is not None:
+                    mgr_target.cache_manager.begin_step("uncond")
                 noise_pred_uncond = model(
                     latent_model_input, t=timestep, **arg_null)[0]
                 if offload_model:
@@ -431,8 +641,13 @@ class WanI2V:
                 del latent_model_input, timestep
 
             if offload_model:
-                self.low_noise_model.cpu()
-                self.high_noise_model.cpu()
+                self.low_noise_model.cpu(); self.high_noise_model.cpu()
+                # Move cached residuals with offload
+                for m in (self.low_noise_model, self.high_noise_model):
+                    target = getattr(m, "module", m)
+                    mgr = getattr(target, "cache_manager", None)
+                    if mgr is not None:
+                        mgr.move_cached_residuals_to(torch.device('cpu'))
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
@@ -446,4 +661,11 @@ class WanI2V:
         if dist.is_initialized():
             dist.barrier()
 
+        # Emit Cache Manager telemetry on rank 0 if enabled.
+        if self.rank == 0:
+            for name, m in (("low", self.low_noise_model), ("high", self.high_noise_model)):
+                target = getattr(m, "module", m)
+                mgr = getattr(target, "cache_manager", None)
+                if mgr is not None and (mgr.cfg.enable_fb or mgr.cfg.enable_tc):
+                    logging.info(f"CacheManager[{name}] summary: {mgr.summary()}")
         return videos[0] if self.rank == 0 else None

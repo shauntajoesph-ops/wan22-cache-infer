@@ -40,7 +40,7 @@ poetry run pip install git+https://github.com/Dao-AILab/flash-attention.git
 Once the installation is complete, you can run **Wan2.2** using:
 
 ```bash
-poetry run python generate.py --task t2v-A14B --size '1280*720' --ckpt_dir ./Wan2.2-T2V-A14B --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
+poetry run python generate.py --task i2v-A14B --size '1280*720' --ckpt_dir ./Wan2.2-I2V-A14B --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
 ```
 
 #### Test

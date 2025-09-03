@@ -22,10 +22,6 @@ from wan.inference import INFERENCE_ONLY
 from wan.utils.utils import merge_video_audio, save_video, str2bool
 
 EXAMPLE_PROMPT = {
-    "t2v-A14B": {
-        "prompt":
-            "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
-    },
     "i2v-A14B": {
         "prompt":
             "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside.",
@@ -64,6 +60,25 @@ def _validate_args(args):
         assert args.image is not None, "Please specify the image path for i2v."
 
     cfg = WAN_CONFIGS[args.task]
+    # Propagate TeaCache flags via config for pipelines to consume (minimal surface change).
+    # Pipelines read these attributes to attach per-model TeaCache state when timesteps are known.
+    cfg.teacache = args.teacache
+    cfg.teacache_thresh = args.teacache_thresh
+    cfg.teacache_policy = args.teacache_policy
+    cfg.teacache_warmup = args.teacache_warmup
+    cfg.teacache_last_steps = args.teacache_last_steps
+    cfg.teacache_alternating = args.teacache_alternating
+
+    # Propagate FBCache flags similarly; pipelines may attach per-model FBCache state.
+    cfg.fbcache = getattr(args, "fbcache", False)
+    cfg.fb_thresh = getattr(args, "fb_thresh", 0.08)
+    cfg.fb_metric = getattr(args, "fb_metric", "hidden_rel_l1")
+    cfg.fb_downsample = getattr(args, "fb_downsample", 1)
+    cfg.fb_ema = getattr(args, "fb_ema", 0.0)
+    cfg.fb_warmup = getattr(args, "fb_warmup", 1)
+    cfg.fb_last_steps = getattr(args, "fb_last_steps", 1)
+    cfg.fb_cfg_sep_diff = getattr(args, "fb_cfg_sep_diff", True)
+    cfg.teacache_alternating = args.teacache_alternating
 
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
@@ -93,7 +108,7 @@ def _parse_args():
     parser.add_argument(
         "--task",
         type=str,
-        default="t2v-A14B",
+        default="i2v-A14B",
         choices=list(WAN_CONFIGS.keys()),
         help="The task to run.")
     parser.add_argument(
@@ -200,6 +215,97 @@ def _parse_args():
         type=float,
         default=None,
         help="Classifier free guidance scale.")
+    # TeaCache flags (Phase 1: I2V & TI2V only)
+    parser.add_argument(
+        "--teacache",
+        action="store_true",
+        default=False,
+        help="Enable TeaCache-style conditional transformer skipping (I2V/TI2V only)."
+    )
+    parser.add_argument(
+        "--teacache_thresh",
+        type=float,
+        default=0.08,
+        help="TeaCache accumulator threshold; higher values skip more but may degrade quality."
+    )
+    parser.add_argument(
+        "--teacache_policy",
+        type=str,
+        default="linear",
+        help="TeaCache rescale policy (default: 'linear')."
+    )
+    parser.add_argument(
+        "--teacache_warmup",
+        type=int,
+        default=1,
+        help="Number of initial steps to force compute."
+    )
+    parser.add_argument(
+        "--teacache_last_steps",
+        type=int,
+        default=1,
+        help="Number of final steps to force compute."
+    )
+    parser.add_argument(
+        "--teacache_alternating",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable alternating skip eligibility (every other executed step). "
+            "Useful to smooth long sequences of reuses; default off."
+        ),
+    )
+
+    # FBCache flags (I2V/TI2V only). Defaults are conservative.
+    parser.add_argument(
+        "--fbcache",
+        action="store_true",
+        default=False,
+        help="Enable First-Block Cache (FBCache) gating (I2V/TI2V only).",
+    )
+    parser.add_argument(
+        "--fb_thresh",
+        type=float,
+        default=0.08,
+        help="FBCache threshold (relative metric accumulator). Conservative default 0.08.",
+    )
+    parser.add_argument(
+        "--fb_metric",
+        type=str,
+        default="hidden_rel_l1",
+        choices=["hidden_rel_l1", "residual_rel_l1", "hidden_rel_l2"],
+        help="FBCache gating metric (default: hidden_rel_l1).",
+    )
+    parser.add_argument(
+        "--fb_downsample",
+        type=int,
+        default=1,
+        help="Stride for computing the FBCache metric over tokens (1,2,4).",
+    )
+    parser.add_argument(
+        "--fb_ema",
+        type=float,
+        default=0.0,
+        help="EMA factor in [0,1) for smoothing the metric (0 disables).",
+    )
+    parser.add_argument(
+        "--fb_warmup",
+        type=int,
+        default=1,
+        help="Force compute during the first K executed steps for FBCache.",
+    )
+    parser.add_argument(
+        "--fb_last_steps",
+        type=int,
+        default=1,
+        help="Force compute for the last K executed steps for FBCache.",
+    )
+    parser.add_argument(
+        "--fb_cfg_sep_diff",
+        type=str2bool,
+        default=True,
+        help="If true, compute CFG diff separately; else reuse cond diff for CFG.",
+    )
     parser.add_argument(
         "--convert_model_dtype",
         action="store_true",
@@ -358,32 +464,7 @@ def generate(args):
     # - use_sp (Ulysses): sequence parallel attention for lower KV memory.
     # - t5_cpu: keep T5 on CPU to save VRAM.
     # - convert_model_dtype: convert to param_dtype (bf16/fp16) to speed matmuls.
-    if "t2v" in args.task:
-        logging.info("Creating WanT2V pipeline.")
-        wan_t2v = wan.WanT2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-        )
-
-        logging.info(f"Generating video ...")
-        video = wan_t2v.generate(
-            args.prompt,
-            size=SIZE_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
-    elif "ti2v" in args.task:
+    if "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
         wan_ti2v = wan.WanTI2V(
             config=cfg,

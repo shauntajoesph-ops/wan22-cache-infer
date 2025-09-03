@@ -5,6 +5,7 @@ import torch.cuda.amp as amp
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
+# Legacy TeaCache helpers removed; unified CacheManager handles gating
 
 
 def pad_freqs(original_tensor, target_len):
@@ -131,8 +132,35 @@ def sp_dit_forward(
         context=context,
         context_lens=context_lens)
 
-    for block in self.blocks:
-        x = block(x, **kwargs)
+    # Unified Cache Manager (SP): priority FB -> TC -> compute
+    from ..utils.cache_manager import CacheManager  # local import
+    cache_mgr = getattr(self, "cache_manager", None)
+    if cache_mgr is None or (not cache_mgr.cfg.enable_fb and not cache_mgr.cfg.enable_tc):
+        for block in self.blocks:
+            x = block(x, **kwargs)
+    else:
+        block0 = self.blocks[0]
+        norm_x = block0.norm1(x).float()
+        with amp.autocast(dtype=torch.float32):
+            e_chunks = (block0.modulation.unsqueeze(0) + kwargs["e"]).chunk(6, dim=2)
+        mod_inp = norm_x * (1 + e_chunks[1].squeeze(2)) + e_chunks[0].squeeze(2)
+
+        x_after_block0 = None
+        if cache_mgr.cfg.enable_fb and str(cache_mgr.cfg.fb_metric).startswith("residual"):
+            x_after_block0 = self.blocks[0](x, **kwargs)
+
+        decision = cache_mgr.decide(x=x, mod_inp=mod_inp, x_after_block0=x_after_block0)
+        x_before = x
+        x, resume_from = cache_mgr.apply(decision, x)
+        if decision.action == "compute":
+            if resume_from <= 0:
+                for block in self.blocks:
+                    x = block(x, **kwargs)
+            else:
+                x = x_after_block0 if x_after_block0 is not None else self.blocks[0](x, **kwargs)
+                for block in self.blocks[1:]:
+                    x = block(x, **kwargs)
+            cache_mgr.update(decision, x_before=x_before, x_after=x)
 
     # head
     x = self.head(x, e)

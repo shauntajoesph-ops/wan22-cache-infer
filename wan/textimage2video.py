@@ -23,14 +23,13 @@ from .distributed.util import get_world_size
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
-from .utils.teacache import TeaCacheState
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from .utils.fbcache import FBCacheState, reset as _fbcache_reset
+from .utils.cache_manager import CacheManager, CMConfig
 from .utils.utils import best_output_size, masks_like
 from .distributed.util import get_world_size
 
@@ -253,7 +252,6 @@ class WanTI2V:
             st.cfg_sep_diff = bool(self._fbcache_cfg["cfg_sep_diff"])  # type: ignore[attr-defined]
             st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
         _fbcache_reset(getattr(target, "fbcache"))  # type: ignore[arg-type]
-            setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
 
     def _log_teacache_stats(self):
         """Log end-of-run TeaCache telemetry (rank 0 only)."""
@@ -732,9 +730,28 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            # Attach/refresh cache states once per run when timesteps are available.
+            # Attach legacy cache states, then Cache Manager (preferred)
             self._attach_teacache_state(len(timesteps))
             self._attach_fbcache_state(len(timesteps))
+            mgr_cfg = CMConfig(
+                num_steps=int(len(timesteps)),
+                warmup=int(getattr(self.config, "teacache_warmup", 1)),
+                last_steps=int(getattr(self.config, "teacache_last_steps", 1)),
+                enable_tc=bool(getattr(self.config, "teacache", False)),
+                tc_thresh=float(getattr(self.config, "teacache_thresh", 0.08)),
+                tc_policy=str(getattr(self.config, "teacache_policy", "linear")),
+                enable_fb=bool(getattr(self.config, "fbcache", False)),
+                fb_thresh=float(getattr(self.config, "fb_thresh", 0.08)),
+                fb_metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")),
+                fb_downsample=int(getattr(self.config, "fb_downsample", 1)),
+                fb_ema=float(getattr(self.config, "fb_ema", 0.0)),
+                cfg_sep_diff=False,
+                evaluation_order=("fb", "tc"),
+                sp_world_size=self.sp_size,
+            )
+            target = getattr(self.model, "module", self.model)
+            target.cache_manager = CacheManager(mgr_cfg)
+            target.cache_manager.attach(num_steps=len(timesteps), sp_world_size=self.sp_size)
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
@@ -749,22 +766,16 @@ class WanTI2V:
                 ])
                 timestep = temp_ts.unsqueeze(0)
 
-                # TeaCache/FBCache: cond branch first; increment executed step here.
-                if getattr(self.model, "enable_teacache", False):  # type: ignore[attr-defined]
-                    self.model.teacache.branch = 'cond'  # type: ignore[attr-defined]
-                    self.model.teacache.cnt += 1  # type: ignore[attr-defined]
-                if getattr(self.model, "enable_fbcache", False):  # type: ignore[attr-defined]
-                    self.model.fbcache.branch = 'cond'  # type: ignore[attr-defined]
-                    self.model.fbcache.cnt += 1  # type: ignore[attr-defined]
+                # (CFG Cache) Branch=cond
+                if getattr(target, "cache_manager", None) is not None:
+                    target.cache_manager.begin_step("cond")
 
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
-                if getattr(self.model, "enable_teacache", False):  # type: ignore[attr-defined]
-                    self.model.teacache.branch = 'uncond'  # type: ignore[attr-defined]
-                if getattr(self.model, "enable_fbcache", False):  # type: ignore[attr-defined]
-                    self.model.fbcache.branch = 'uncond'  # type: ignore[attr-defined]
+                if getattr(target, "cache_manager", None) is not None:
+                    target.cache_manager.begin_step("uncond")
                 noise_pred_uncond = self.model(
                     latent_model_input, t=timestep, **arg_null)[0]
                 if offload_model:
@@ -787,7 +798,9 @@ class WanTI2V:
             if offload_model:
                 self.model.cpu()
                 # Move cached residuals to CPU as well to release VRAM.
-                self._move_teacache_residual_to_cpu()
+                mgr = getattr(target, "cache_manager", None)
+                if mgr is not None:
+                    mgr.move_cached_residuals_to(torch.device('cpu'))
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 

@@ -37,6 +37,7 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.fbcache import FBCacheState, reset as _fbcache_reset
+from .utils.cache_manager import CacheManager, CMConfig
 
 
 def load_safetensors(path):
@@ -735,8 +736,26 @@ class WanS2V:
                     raise NotImplementedError("Unsupported solver.")
 
                 latents = deepcopy(noise)
-                # Attach/refresh TeaCache state to noise model once per run when timesteps are known.
-                self._attach_teacache_state(len(timesteps))
+                # Attach unified Cache Manager for S2V when timesteps are known.
+                mgr_cfg = CMConfig(
+                    num_steps=int(len(timesteps)),
+                    warmup=int(getattr(self.config, "teacache_warmup", 1)),
+                    last_steps=int(getattr(self.config, "teacache_last_steps", 1)),
+                    enable_tc=bool(getattr(self.config, "teacache", False)),
+                    tc_thresh=float(getattr(self.config, "teacache_thresh", 0.08)),
+                    tc_policy=str(getattr(self.config, "teacache_policy", "linear")),
+                    enable_fb=bool(getattr(self.config, "fbcache", False)),
+                    fb_thresh=float(getattr(self.config, "fb_thresh", 0.08)),
+                    fb_metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")),
+                    fb_downsample=int(getattr(self.config, "fb_downsample", 1)),
+                    fb_ema=float(getattr(self.config, "fb_ema", 0.0)),
+                    cfg_sep_diff=False,
+                    evaluation_order=("fb", "tc"),
+                    sp_world_size=self.sp_size,
+                )
+                target_m = getattr(self.noise_model, "module", self.noise_model)
+                target_m.cache_manager = CacheManager(mgr_cfg)
+                target_m.cache_manager.attach(num_steps=len(timesteps), sp_world_size=self.sp_size)
                 with torch.no_grad():
                     left_idx = r * infer_frames
                     right_idx = r * infer_frames + infer_frames
@@ -778,20 +797,19 @@ class WanS2V:
                     timestep = [t]
 
                     timestep = torch.stack(timestep).to(self.device)
-                    # TeaCache: Set branch to 'cond' and increment step counter for cond only.
-                    if getattr(self.noise_model, "enable_teacache", False):  # type: ignore[attr-defined]
-                        target = getattr(self.noise_model, "module", self.noise_model)
-                        target.teacache.branch = 'cond'  # type: ignore[attr-defined]
-                        target.teacache.cnt += 1  # type: ignore[attr-defined]
+                    # (CFG Cache) Branch=cond
+                    target = getattr(self.noise_model, "module", self.noise_model)
+                    mgr = getattr(target, "cache_manager", None)
+                    if mgr is not None:
+                        mgr.begin_step("cond")
 
                     noise_pred_cond = self.noise_model(
                         latent_model_input, t=timestep, **arg_c)
 
                     if guide_scale > 1:
-                        # TeaCache: switch to 'uncond' branch for the second pass.
-                        if getattr(self.noise_model, "enable_teacache", False):  # type: ignore[attr-defined]
-                            target = getattr(self.noise_model, "module", self.noise_model)
-                            target.teacache.branch = 'uncond'  # type: ignore[attr-defined]
+                        # (CFG Cache) Branch=uncond
+                        if mgr is not None:
+                            mgr.begin_step("uncond")
                         noise_pred_uncond = self.noise_model(
                             latent_model_input, t=timestep, **arg_null)
                         noise_pred = [
@@ -812,7 +830,9 @@ class WanS2V:
                 if offload_model:
                     self.noise_model.cpu()
                     # Move cached residuals to CPU as well to release VRAM.
-                    self._move_teacache_residual_to_cpu()
+                    mgr = getattr(target, "cache_manager", None)
+                    if mgr is not None:
+                        mgr.move_cached_residuals_to(torch.device('cpu'))
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                 latents = torch.stack(latents)

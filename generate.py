@@ -22,10 +22,6 @@ from wan.inference import INFERENCE_ONLY
 from wan.utils.utils import merge_video_audio, save_video, str2bool
 
 EXAMPLE_PROMPT = {
-    "t2v-A14B": {
-        "prompt":
-            "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
-    },
     "i2v-A14B": {
         "prompt":
             "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside.",
@@ -112,7 +108,7 @@ def _parse_args():
     parser.add_argument(
         "--task",
         type=str,
-        default="t2v-A14B",
+        default="i2v-A14B",
         choices=list(WAN_CONFIGS.keys()),
         help="The task to run.")
     parser.add_argument(
@@ -468,32 +464,7 @@ def generate(args):
     # - use_sp (Ulysses): sequence parallel attention for lower KV memory.
     # - t5_cpu: keep T5 on CPU to save VRAM.
     # - convert_model_dtype: convert to param_dtype (bf16/fp16) to speed matmuls.
-    if "t2v" in args.task:
-        logging.info("Creating WanT2V pipeline.")
-        wan_t2v = wan.WanT2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-        )
-
-        logging.info(f"Generating video ...")
-        video = wan_t2v.generate(
-            args.prompt,
-            size=SIZE_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
-    elif "ti2v" in args.task:
+    if "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
         wan_ti2v = wan.WanTI2V(
             config=cfg,

@@ -31,6 +31,7 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.fbcache import FBCacheState, reset as _fbcache_reset
+from .utils.cache_manager import CacheManager, CMConfig
 
 
 class WanI2V:
@@ -385,6 +386,11 @@ class WanI2V:
             if next(getattr(self, offload_model_name).parameters()).device.type == 'cuda':
                 getattr(self, offload_model_name).to('cpu')
                 self._move_teacache_residual_to_cpu(getattr(self, offload_model_name))
+                # (Cache Manager) Move manager residuals to CPU alongside model
+                _target = getattr(getattr(self, offload_model_name), "module", getattr(self, offload_model_name))
+                _mgr = getattr(_target, "cache_manager", None)
+                if _mgr is not None:
+                    _mgr.move_cached_residuals_to(torch.device('cpu'))
             # Bring the required expert to GPU if needed (residual moved on demand in forward).
             if next(getattr(self, required_model_name).parameters()).device.type == 'cpu':
                 getattr(self, required_model_name).to(self.device)
@@ -569,9 +575,29 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
-            # Attach/refresh TeaCache and FBCache states to experts after timesteps are known (once per run).
+            # Attach legacy Tea/FBCache state (compat), then attach Cache Manager (preferred).
             self._attach_teacache_state(len(timesteps))
             self._attach_fbcache_state(len(timesteps))
+            mgr_cfg = CMConfig(
+                num_steps=int(len(timesteps)),
+                warmup=int(getattr(self.config, "teacache_warmup", 1)),
+                last_steps=int(getattr(self.config, "teacache_last_steps", 1)),
+                enable_tc=bool(getattr(self.config, "teacache", False)),
+                tc_thresh=float(getattr(self.config, "teacache_thresh", 0.08)),
+                tc_policy=str(getattr(self.config, "teacache_policy", "linear")),
+                enable_fb=bool(getattr(self.config, "fbcache", False)),
+                fb_thresh=float(getattr(self.config, "fb_thresh", 0.08)),
+                fb_metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")),
+                fb_downsample=int(getattr(self.config, "fb_downsample", 1)),
+                fb_ema=float(getattr(self.config, "fb_ema", 0.0)),
+                cfg_sep_diff=False,
+                evaluation_order=("fb", "tc"),
+                sp_world_size=self.sp_size,
+            )
+            for m in (self.low_noise_model, self.high_noise_model):
+                target = getattr(m, "module", m)
+                target.cache_manager = CacheManager(mgr_cfg)
+                target.cache_manager.attach(num_steps=len(timesteps), sp_world_size=self.sp_size)
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
@@ -584,19 +610,18 @@ class WanI2V:
                 sample_guide_scale = guide_scale[1] if t.item(
                 ) >= boundary else guide_scale[0]
 
-                # TeaCache: set branch to 'cond' and increment cnt once per step on cond.
-                if getattr(model, "enable_teacache", False):  # type: ignore[attr-defined]
-                    model.teacache.branch = 'cond'  # type: ignore[attr-defined]
-                    # Increase step counter on cond only.
-                    model.teacache.cnt += 1  # type: ignore[attr-defined]
+                # (CFG Cache) Branch=cond; manager enforces lifecycle
+                mgr_target = getattr(model, "module", model)
+                if getattr(mgr_target, "cache_manager", None) is not None:
+                    mgr_target.cache_manager.begin_step("cond")
 
                 noise_pred_cond = model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
-                # TeaCache: switch to 'uncond' branch for the second evaluation.
-                if getattr(model, "enable_teacache", False):  # type: ignore[attr-defined]
-                    model.teacache.branch = 'uncond'  # type: ignore[attr-defined]
+                # (CFG Cache) Branch=uncond; reuse cond decision when cfg_sep_diff=false
+                if getattr(mgr_target, "cache_manager", None) is not None:
+                    mgr_target.cache_manager.begin_step("uncond")
                 noise_pred_uncond = model(
                     latent_model_input, t=timestep, **arg_null)[0]
                 if offload_model:
@@ -616,10 +641,13 @@ class WanI2V:
                 del latent_model_input, timestep
 
             if offload_model:
-                self.low_noise_model.cpu()
-                self._move_teacache_residual_to_cpu(self.low_noise_model)
-                self.high_noise_model.cpu()
-                self._move_teacache_residual_to_cpu(self.high_noise_model)
+                self.low_noise_model.cpu(); self.high_noise_model.cpu()
+                # Move cached residuals with offload
+                for m in (self.low_noise_model, self.high_noise_model):
+                    target = getattr(m, "module", m)
+                    mgr = getattr(target, "cache_manager", None)
+                    if mgr is not None:
+                        mgr.move_cached_residuals_to(torch.device('cpu'))
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
@@ -633,8 +661,11 @@ class WanI2V:
         if dist.is_initialized():
             dist.barrier()
 
-        # Emit TeaCache telemetry on rank 0 if enabled.
+        # Emit Cache Manager telemetry on rank 0 if enabled.
         if self.rank == 0:
-            self._log_teacache_stats()
-            self._log_fbcache_stats()
+            for name, m in (("low", self.low_noise_model), ("high", self.high_noise_model)):
+                target = getattr(m, "module", m)
+                mgr = getattr(target, "cache_manager", None)
+                if mgr is not None and (mgr.cfg.enable_fb or mgr.cfg.enable_tc):
+                    logging.info(f"CacheManager[{name}] summary: {mgr.summary()}")
         return videos[0] if self.rank == 0 else None

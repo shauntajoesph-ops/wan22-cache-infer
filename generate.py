@@ -77,8 +77,12 @@ def _validate_args(args):
     cfg.fb_ema = getattr(args, "fb_ema", 0.0)
     cfg.fb_warmup = getattr(args, "fb_warmup", 1)
     cfg.fb_last_steps = getattr(args, "fb_last_steps", 1)
-    cfg.fb_cfg_sep_diff = getattr(args, "fb_cfg_sep_diff", True)
+    cfg.fb_cfg_sep_diff = getattr(args, "fb_cfg_sep_diff", False)
     cfg.teacache_alternating = args.teacache_alternating
+    cfg.legacy_cache_compat = getattr(args, "legacy_cache_compat", False)
+    # Perf hooks
+    cfg.compile_mode = getattr(args, "compile", "none")
+    cfg.cuda_graphs = getattr(args, "cuda_graphs", False)
 
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
@@ -303,14 +307,35 @@ def _parse_args():
     parser.add_argument(
         "--fb_cfg_sep_diff",
         type=str2bool,
-        default=True,
-        help="If true, compute CFG diff separately; else reuse cond diff for CFG.",
+        default=False,
+        help="If true, compute CFG diff separately; else reuse cond diff for CFG (default).",
+    )
+    parser.add_argument(
+        "--legacy_cache_compat",
+        type=str2bool,
+        default=False,
+        help="Enable legacy TeaCache/FBCache attach paths (for compatibility). Default off; prefer unified Cache Manager.",
     )
     parser.add_argument(
         "--convert_model_dtype",
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
+
+    # Optional performance hooks
+    parser.add_argument(
+        "--compile",
+        type=str,
+        default="none",
+        choices=["none", "reduce-overhead", "max-autotune"],
+        help="Optional torch.compile mode: 'none' (default), 'reduce-overhead', or 'max-autotune'."
+    )
+    parser.add_argument(
+        "--cuda_graphs",
+        action="store_true",
+        default=False,
+        help="Attempt to enable CUDA Graphs for steady-state regions (experimental; limited support)."
+    )
 
     # following args only works for s2v
     parser.add_argument(
@@ -423,6 +448,8 @@ def generate(args):
 
     logging.info(f"Generation job args: {args}")
     logging.info(f"Generation model config: {cfg}")
+    if getattr(cfg, "cuda_graphs", False):
+        logging.info("CUDA Graphs requested: experimental hook present; continuing without capture unless explicitly wired in the pipeline.")
 
     if dist.is_initialized():
         base_seed = [args.base_seed] if rank == 0 else [None]

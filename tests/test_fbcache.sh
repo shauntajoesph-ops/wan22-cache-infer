@@ -32,8 +32,8 @@ if [ -d "$TI2V_DIR" ]; then
     --t5_cpu \
     --fbcache --fb_thresh 0.08 \
     --save_file "$LOGDIR/ti2v_fbcache.mp4" | tee "$LOG_TTI"
-  if grep -q "FBCache\[\|FBCache skips:" "$LOG_TTI"; then
-    echo "[OK] TI2V FBCache telemetry present."
+  if grep -E -q "FBCache\\[|FBCache skips:|CacheManager" "$LOG_TTI"; then
+    echo "[OK] TI2V cache telemetry present."
   else
     echo "[WARN] TI2V telemetry not found; generation may still have succeeded."
   fi
@@ -54,8 +54,8 @@ if [ -d "$I2V_DIR" ]; then
     --t5_cpu \
     --fbcache --fb_thresh 0.08 \
     --save_file "$LOGDIR/i2v_fbcache.mp4" | tee "$LOG_I2V"
-  if grep -q "FBCache\[\|FBCache skips:" "$LOG_I2V"; then
-    echo "[OK] I2V FBCache telemetry present."
+  if grep -E -q "FBCache\\[|FBCache skips:|CacheManager" "$LOG_I2V"; then
+    echo "[OK] I2V cache telemetry present."
   else
     echo "[WARN] I2V telemetry not found; generation may still have succeeded."
   fi
@@ -84,4 +84,3 @@ else
 fi
 
 echo "[FBCache Test] Done. Logs in $LOGDIR"
-

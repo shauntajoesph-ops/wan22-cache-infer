@@ -163,16 +163,21 @@ class CacheManager:
         return v
 
     def _sp_mean(self, value: float, device: torch.device) -> float:
-        if self.cfg.sp_world_size <= 1:
-            return value
+        """Average a scalar across the active distributed group if initialized.
+
+        Uses the actual group world size to normalize instead of relying on the
+        configured `sp_world_size`, which may be stale or mismatched.
+        """
         try:
             import torch.distributed as dist
             if not dist.is_initialized():
                 return value
             t = torch.tensor([value], dtype=torch.float32, device=device)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            return float(t.item() / max(1, int(self.cfg.sp_world_size)))
+            ws = max(1, int(dist.get_world_size()))
+            return float(t.item() / ws)
         except Exception:
+            # Any reduction failure forces local compute downstream via failsafe
             self.failsafe_count += 1
             return value
 
@@ -332,8 +337,13 @@ class CacheManager:
         if decision.action != "skip":
             return x, decision.resume_from_block
 
-        # Guard: residual existence and shape
-        if br.residual is None or br.shape is None or tuple(br.shape) != tuple(x.shape):
+        # Guard: residual existence, shape, and dtype match
+        if (
+            br.residual is None
+            or br.shape is None
+            or tuple(br.shape) != tuple(x.shape)
+            or (br.dtype is not None and br.dtype != x.dtype)
+        ):
             # Pair-consistency failsafe if uncond cannot follow cond skip
             if self.branch == "uncond":
                 self.pair_divergence_failsafes += 1

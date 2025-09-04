@@ -24,6 +24,7 @@ from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
 from .utils.teacache import TeaCacheState
+from .utils.graphs import CUDAGraphRunner
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -80,6 +81,8 @@ class WanI2V:
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self._dit_fsdp = dit_fsdp
+        self._use_sp = use_sp
 
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
@@ -209,7 +212,6 @@ class WanI2V:
                     st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
                     st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
                 setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
-        _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
 
     def _move_teacache_residual_to_cpu(self, model):
         """If TeaCache is attached, move cached residuals to CPU to free VRAM.
@@ -258,7 +260,7 @@ class WanI2V:
             ema=float(getattr(self.config, "fb_ema", 0.0)),
             warmup=int(getattr(self.config, "fb_warmup", 1)),
             last_steps=int(getattr(self.config, "fb_last_steps", 1)),
-            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", True)),
+            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", False)),
         )
         # Attach to both experts and their inner modules (if wrapped)
         for model in (self.low_noise_model, self.high_noise_model):
@@ -354,6 +356,16 @@ class WanI2V:
                 model.to(self.param_dtype)
             if not self.init_on_cpu:
                 model.to(self.device)
+
+        # Optional: torch.compile for local (non-FSDP) models
+        try:
+            compile_mode = str(getattr(self.config, "compile_mode", "none")).lower()
+            if compile_mode != "none" and not dit_fsdp and not use_sp:
+                import torch
+                model = torch.compile(model, mode=compile_mode)
+                logging.info(f"Applied torch.compile(mode={compile_mode}) to DiT model")
+        except Exception as e:  # pragma: no cover
+            logging.warning(f"torch.compile failed or unavailable: {e}")
 
         return model
 
@@ -575,9 +587,10 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
-            # Attach legacy Tea/FBCache state (compat), then attach Cache Manager (preferred).
-            self._attach_teacache_state(len(timesteps))
-            self._attach_fbcache_state(len(timesteps))
+            # Attach legacy Tea/FBCache state only when compatibility flag is on.
+            if bool(getattr(self.config, "legacy_cache_compat", False)):
+                self._attach_teacache_state(len(timesteps))
+                self._attach_fbcache_state(len(timesteps))
             mgr_cfg = CMConfig(
                 num_steps=int(len(timesteps)),
                 warmup=int(getattr(self.config, "teacache_warmup", 1)),
@@ -590,7 +603,7 @@ class WanI2V:
                 fb_metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")),
                 fb_downsample=int(getattr(self.config, "fb_downsample", 1)),
                 fb_ema=float(getattr(self.config, "fb_ema", 0.0)),
-                cfg_sep_diff=False,
+                cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", False)),
                 evaluation_order=("fb", "tc"),
                 sp_world_size=self.sp_size,
             )
@@ -598,6 +611,15 @@ class WanI2V:
                 target = getattr(m, "module", m)
                 target.cache_manager = CacheManager(mgr_cfg)
                 target.cache_manager.attach(num_steps=len(timesteps), sp_world_size=self.sp_size)
+
+            # Optional CUDA Graphs: enable only on single-GPU, no FSDP/SP, no offload
+            graphs_ok = bool(getattr(self.config, "cuda_graphs", False)) and (self.sp_size == 1) and (not self._dit_fsdp) and (not offload_model)
+            # Hold per-expert runners
+            for m in (self.low_noise_model, self.high_noise_model):
+                tgt = getattr(m, "module", m)
+                if graphs_ok:
+                    setattr(tgt, "_cg_cond", getattr(tgt, "_cg_cond", None))
+                    setattr(tgt, "_cg_uncond", getattr(tgt, "_cg_uncond", None))
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
@@ -615,15 +637,45 @@ class WanI2V:
                 if getattr(mgr_target, "cache_manager", None) is not None:
                     mgr_target.cache_manager.begin_step("cond")
 
-                noise_pred_cond = model(
-                    latent_model_input, t=timestep, **arg_c)[0]
+                # Cond forward (optionally via CUDA Graphs)
+                if graphs_ok and getattr(mgr_target, "_cg_cond", None) is not None:
+                    runner: CUDAGraphRunner = getattr(mgr_target, "_cg_cond")
+                    noise_pred_cond = runner.replay(latent_model_input[0], timestep)[0]
+                elif graphs_ok and getattr(mgr_target, "_cg_cond", None) is None:
+                    try:
+                        fn = lambda l, ts: model([l], t=ts, **arg_c)
+                        runner = CUDAGraphRunner(fn=fn, example_latent=latent_model_input[0], example_timestep=timestep)
+                        setattr(mgr_target, "_cg_cond", runner)
+                        noise_pred_cond = runner.replay(latent_model_input[0], timestep)[0]
+                        logging.info("CUDA Graphs capture initialized for cond branch")
+                    except Exception as e:
+                        logging.warning(f"CUDA Graphs capture (cond) failed; falling back: {e}")
+                        graphs_ok = False
+                        noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
+                else:
+                    noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
                 # (CFG Cache) Branch=uncond; reuse cond decision when cfg_sep_diff=false
                 if getattr(mgr_target, "cache_manager", None) is not None:
                     mgr_target.cache_manager.begin_step("uncond")
-                noise_pred_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                # Uncond forward (optionally via CUDA Graphs)
+                if graphs_ok and getattr(mgr_target, "_cg_uncond", None) is not None:
+                    runner_u: CUDAGraphRunner = getattr(mgr_target, "_cg_uncond")
+                    noise_pred_uncond = runner_u.replay(latent_model_input[0], timestep)[0]
+                elif graphs_ok and getattr(mgr_target, "_cg_uncond", None) is None:
+                    try:
+                        fn_u = lambda l, ts: model([l], t=ts, **arg_null)
+                        runner_u = CUDAGraphRunner(fn=fn_u, example_latent=latent_model_input[0], example_timestep=timestep)
+                        setattr(mgr_target, "_cg_uncond", runner_u)
+                        noise_pred_uncond = runner_u.replay(latent_model_input[0], timestep)[0]
+                        logging.info("CUDA Graphs capture initialized for uncond branch")
+                    except Exception as e:
+                        logging.warning(f"CUDA Graphs capture (uncond) failed; falling back: {e}")
+                        graphs_ok = False
+                        noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
+                else:
+                    noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred = noise_pred_uncond + sample_guide_scale * (
@@ -668,4 +720,7 @@ class WanI2V:
                 mgr = getattr(target, "cache_manager", None)
                 if mgr is not None and (mgr.cfg.enable_fb or mgr.cfg.enable_tc):
                     logging.info(f"CacheManager[{name}] summary: {mgr.summary()}")
+            logging.info(
+                f"Run perf config: compile_mode={getattr(self.config, 'compile_mode', 'none')}, cuda_graphs={getattr(self.config, 'cuda_graphs', False)}"
+            )
         return videos[0] if self.rank == 0 else None

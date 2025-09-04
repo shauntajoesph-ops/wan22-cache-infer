@@ -7,6 +7,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
+from ..utils.cache_runner import run_with_cache_manager
 
 __all__ = ['WanModel']
 
@@ -408,12 +409,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # initialize weights
         self.init_weights()
-
-        # TeaCache integration (Phase 1):
-        # - Disabled by default; pipelines attach a `TeaCacheState` and flip this flag.
-        # - We avoid importing here to keep model portable without the feature.
-        self.enable_teacache = False  # type: ignore[attr-defined]
-        self.teacache = None  # type: ignore[attr-defined]
+        # Legacy per-module TeaCache/FBCache state removed; use CacheManager instead.
 
     def forward(
         self,
@@ -495,42 +491,24 @@ class WanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens)
 
         # Unified Cache Manager flow (FBCache, TeaCache, CFG Cache)
-        from ..utils.cache_manager import CacheManager  # local import to avoid circulars
-        cache_mgr = getattr(self, "cache_manager", None)
-        if cache_mgr is None or (not cache_mgr.cfg.enable_fb and not cache_mgr.cfg.enable_tc):
-            # Baseline compute: no caching enabled
-            for block in self.blocks:
-                x = block(x, **kwargs)
-        else:
-            # Build early signals from Block-0 for TeaCache/FBCache hidden metric
-            # Expected state (CFG Cache): branch set by pipeline via begin_step('cond'|'uncond')
-            # Phase: init/warmup/main/last-steps determined by executed cond steps
-            # SP sync: handled inside manager when computing scalar metrics
-            block0 = self.blocks[0]
-            norm_x = block0.norm1(x).float()
+        def _build_mod_inp(m: "WanModel", x_in: torch.Tensor, kw: dict) -> torch.Tensor:
+            block0 = m.blocks[0]
+            norm_x = block0.norm1(x_in).float()
             with torch.amp.autocast('cuda', dtype=torch.float32):
-                e_chunks = (block0.modulation.unsqueeze(0) + kwargs["e"]).chunk(6, dim=2)
-            mod_inp = norm_x * (1 + e_chunks[1].squeeze(2)) + e_chunks[0].squeeze(2)
+                e_chunks = (block0.modulation.unsqueeze(0) + kw["e"]).chunk(6, dim=2)
+            return norm_x * (1 + e_chunks[1].squeeze(2)) + e_chunks[0].squeeze(2)
 
-            # Optional residual metric (FBCache): compute Block-0 once to enable resume_from=1
-            x_after_block0 = None
-            if cache_mgr.cfg.enable_fb and str(cache_mgr.cfg.fb_metric).startswith("residual"):
-                x_after_block0 = self.blocks[0](x, **kwargs)
+        def _build_block0_residual(m: "WanModel", x_in: torch.Tensor, kw: dict) -> torch.Tensor:
+            return m.blocks[0](x_in, **kw)
 
-            # Decide according to priority (FB->TC) and CFG policy
-            decision = cache_mgr.decide(x=x, mod_inp=mod_inp, x_after_block0=x_after_block0)
-            # Apply cached residual (FBCache/TeaCache) or proceed to compute; offload is handled by pipeline
-            x_before = x
-            x, resume_from = cache_mgr.apply(decision, x)
-            if decision.action == "compute":
-                if resume_from <= 0:
-                    for block in self.blocks:
-                        x = block(x, **kwargs)
-                else:
-                    x = x_after_block0 if x_after_block0 is not None else self.blocks[0](x, **kwargs)
-                    for block in self.blocks[1:]:
-                        x = block(x, **kwargs)
-                cache_mgr.update(decision, x_before=x_before, x_after=x)
+        x = run_with_cache_manager(
+            model=self,
+            x=x,
+            kwargs=kwargs,
+            build_mod_inp=_build_mod_inp,
+            build_block0_residual=_build_block0_residual,
+            per_block_post=None,
+        )
 
         # head
         x = self.head(x, e)

@@ -29,7 +29,6 @@ from .modules.s2v.audio_encoder import AudioEncoder
 from .modules.s2v.model_s2v import WanModel_S2V, sp_attn_forward_s2v
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
-from .utils.teacache import TeaCacheState
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -37,7 +36,6 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.graphs import CUDAGraphRunner
-from .utils.fbcache import FBCacheState, reset as _fbcache_reset
 from .utils.cache_manager import CacheManager, CMConfig
 
 
@@ -216,151 +214,14 @@ class WanS2V:
         return model
 
     def _attach_teacache_state(self, timesteps_len: int):
-        """Attach TeaCache state to the S2V noise model (and inner module if wrapped).
-
-        Args:
-            timesteps_len: Number of denoising steps for this run.
-        """
-        # Refresh config each run
-        self._teacache_cfg = dict(
-            enabled=getattr(self.config, "teacache", False),
-            num_steps=timesteps_len,
-            thresh=getattr(self.config, "teacache_thresh", 0.08),
-            policy=str(getattr(self.config, "teacache_policy", "linear")).lower(),
-            warmup=getattr(self.config, "teacache_warmup", 1),
-            last_steps=getattr(self.config, "teacache_last_steps", 1),
-            alternating=bool(getattr(self.config, "teacache_alternating", False)),
-        )
-        from .utils.teacache import reset as _teacache_reset
-        target = self.noise_model
-        target.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-        if getattr(target, "teacache", None) is None:  # type: ignore[attr-defined]
-            target.teacache = TeaCacheState(  # type: ignore[attr-defined]
-                enabled=bool(self._teacache_cfg["enabled"]),
-                num_steps=int(self._teacache_cfg["num_steps"]),
-                thresh=float(self._teacache_cfg["thresh"]),
-                policy=str(self._teacache_cfg["policy"]),
-                warmup=int(self._teacache_cfg["warmup"]),
-                last_steps=int(self._teacache_cfg["last_steps"]),
-                sp_world_size=get_world_size(),
-            )
-        else:
-            st = getattr(target, "teacache")  # type: ignore[attr-defined]
-            st.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-            st.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
-            st.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
-            st.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
-            st.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
-            st.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
-            st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
-        _teacache_reset(getattr(target, "teacache"))  # type: ignore[arg-type]
-        setattr(target, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
-
-        inner = getattr(target, "module", None)
-        if inner is not None:
-            inner.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-            if getattr(inner, "teacache", None) is None:  # type: ignore[attr-defined]
-                inner.teacache = TeaCacheState(  # type: ignore[attr-defined]
-                    enabled=bool(self._teacache_cfg["enabled"]),
-                    num_steps=int(self._teacache_cfg["num_steps"]),
-                    thresh=float(self._teacache_cfg["thresh"]),
-                    policy=str(self._teacache_cfg["policy"]),
-                    warmup=int(self._teacache_cfg["warmup"]),
-                    last_steps=int(self._teacache_cfg["last_steps"]),
-                    sp_world_size=get_world_size(),
-                )
-            else:
-                st_in = getattr(inner, "teacache")  # type: ignore[attr-defined]
-                st_in.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-                st_in.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
-                st_in.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
-                st_in.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
-                st_in.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
-                st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
-                st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
-            _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
+        """Legacy no-op: CacheManager owns gating now."""
+        return
 
     def _attach_fbcache_state(self, timesteps_len: int):
-        """Attach FBCache to S2V noise model; reset per run. No-op if disabled."""
-        self._fbcache_cfg = dict(
-            enabled=getattr(self.config, "fbcache", False),
-            num_steps=timesteps_len,
-            thresh=getattr(self.config, "fb_thresh", 0.08),
-            metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")).lower(),
-            downsample=int(getattr(self.config, "fb_downsample", 1)),
-            ema=float(getattr(self.config, "fb_ema", 0.0)),
-            warmup=int(getattr(self.config, "fb_warmup", 1)),
-            last_steps=int(getattr(self.config, "fb_last_steps", 1)),
-            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", False)),
-        )
-        target = self.noise_model
-        target.enable_fbcache = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
-        if getattr(target, "fbcache", None) is None:  # type: ignore[attr-defined]
-            target.fbcache = FBCacheState(  # type: ignore[attr-defined]
-                enabled=bool(self._fbcache_cfg["enabled"]),
-                num_steps=int(self._fbcache_cfg["num_steps"]),
-                thresh=float(self._fbcache_cfg["thresh"]),
-                metric=str(self._fbcache_cfg["metric"]),
-                downsample=int(self._fbcache_cfg["downsample"]),
-                ema=float(self._fbcache_cfg["ema"]),
-                warmup=int(self._fbcache_cfg["warmup"]),
-                last_steps=int(self._fbcache_cfg["last_steps"]),
-                cfg_sep_diff=bool(self._fbcache_cfg["cfg_sep_diff"]),
-                sp_world_size=get_world_size(),
-            )
-        else:
-            st = getattr(target, "fbcache")  # type: ignore[attr-defined]
-            st.enabled = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
-            st.num_steps = int(self._fbcache_cfg["num_steps"])  # type: ignore[attr-defined]
-            st.thresh = float(self._fbcache_cfg["thresh"])  # type: ignore[attr-defined]
-            st.metric = str(self._fbcache_cfg["metric"])  # type: ignore[attr-defined]
-            st.downsample = int(self._fbcache_cfg["downsample"])  # type: ignore[attr-defined]
-            st.ema = float(self._fbcache_cfg["ema"])  # type: ignore[attr-defined]
-            st.warmup = int(self._fbcache_cfg["warmup"])  # type: ignore[attr-defined]
-            st.last_steps = int(self._fbcache_cfg["last_steps"])  # type: ignore[attr-defined]
-            st.cfg_sep_diff = bool(self._fbcache_cfg["cfg_sep_diff"])  # type: ignore[attr-defined]
-            st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
-        _fbcache_reset(getattr(target, "fbcache"))  # type: ignore[arg-type]
-        inner = getattr(target, "module", None)
-        if inner is not None:
-            inner.enable_fbcache = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
-            if getattr(inner, "fbcache", None) is None:  # type: ignore[attr-defined]
-                inner.fbcache = FBCacheState(  # type: ignore[attr-defined]
-                    enabled=bool(self._fbcache_cfg["enabled"]),
-                    num_steps=int(self._fbcache_cfg["num_steps"]),
-                    thresh=float(self._fbcache_cfg["thresh"]),
-                    metric=str(self._fbcache_cfg["metric"]),
-                    downsample=int(self._fbcache_cfg["downsample"]),
-                    ema=float(self._fbcache_cfg["ema"]),
-                    warmup=int(self._fbcache_cfg["warmup"]),
-                    last_steps=int(self._fbcache_cfg["last_steps"]),
-                    cfg_sep_diff=bool(self._fbcache_cfg["cfg_sep_diff"]),
-                    sp_world_size=get_world_size(),
-                )
-            else:
-                st_in = getattr(inner, "fbcache")  # type: ignore[attr-defined]
-                st_in.enabled = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
-                st_in.num_steps = int(self._fbcache_cfg["num_steps"])  # type: ignore[attr-defined]
-                st_in.thresh = float(self._fbcache_cfg["thresh"])  # type: ignore[attr-defined]
-                st_in.metric = str(self._fbcache_cfg["metric"])  # type: ignore[attr-defined]
-                st_in.downsample = int(self._fbcache_cfg["downsample"])  # type: ignore[attr-defined]
-                st_in.ema = float(self._fbcache_cfg["ema"])  # type: ignore[attr-defined]
-                st_in.warmup = int(self._fbcache_cfg["warmup"])  # type: ignore[attr-defined]
-                st_in.last_steps = int(self._fbcache_cfg["last_steps"])  # type: ignore[attr-defined]
-                st_in.cfg_sep_diff = bool(self._fbcache_cfg["cfg_sep_diff"])  # type: ignore[attr-defined]
-                st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
-            _fbcache_reset(getattr(inner, "fbcache"))  # type: ignore[arg-type]
-            setattr(inner, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
+        """Legacy no-op: CacheManager owns gating now."""
+        return
 
-    def _move_teacache_residual_to_cpu(self):
-        """If TeaCache is attached, move cached residuals to CPU to free VRAM when offloading."""
-        target = getattr(self.noise_model, "module", self.noise_model)
-        st = getattr(target, "teacache", None)
-        if not st:
-            return
-        for br in (st.cond, st.uncond):
-            if br.prev_residual is not None and br.prev_residual.device.type == 'cuda':
-                br.prev_residual = br.prev_residual.to('cpu')
+    # Legacy TeaCache mover removed; CacheManager handles residual moves.
 
     def get_size_less_than_area(self,
                                 height,

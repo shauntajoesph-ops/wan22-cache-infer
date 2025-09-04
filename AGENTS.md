@@ -132,8 +132,9 @@ FBCache (Within‑Step)
 
 CFG Cache Semantics
 - Default policy (`cfg_sep_diff=false`): cond‑authoritative re‑use — uncond branch follows cond’s action and rescaled metrics; no separate decision.
+- Guarded reuse: when cond decides to skip, uncond only honors skip if a matching residual is available (shape/dtype/device). Otherwise, the manager synthesizes a compute decision for uncond and increments pair divergence.
 - Separate diffs (`--fb_cfg_sep_diff=true`): compute CFG and non‑CFG diffs separately but still follow cond action; useful for analysis.
-- Divergence failsafe: If uncond cannot apply a cond skip (e.g., residual missing/mismatch), increment pair divergence and force compute.
+- Divergence failsafe: If a planned skip cannot be applied at runtime (e.g., residual dropped between `decide()` and `apply()`), `apply()` returns a negative signal and callers must compute; failsafes increment (and pair divergence for uncond).
 
 Distributed (SP/Ulysses) and Invariants
 - Reduction: For SP, all ranks compute identical scalar metrics and perform `all_reduce(mean)`. The actual group world size is queried; if uninitialized or any error occurs, compute continues locally and a failsafe is recorded.
@@ -161,20 +162,20 @@ Integration Patterns (Pipelines)
   1) Compute Block‑0 modulation and `mod_inp`.
   2) If FBCache uses `residual*`, run Block‑0 once to produce `x_after_block0`.
   3) `decision = cache_manager.decide(x, mod_inp, x_after_block0)`.
-  4) `(x, resume_from) = cache_manager.apply(decision, x)`.
-  5) If compute: run blocks (respect `resume_from`), then `cache_manager.update(decision, x_before, x_after)`.
+  4) `(x, resume_from, applied_skip) = cache_manager.apply(decision, x)`.
+  5) If `decision.action == "compute"` or `not applied_skip`: run blocks (respect `resume_from`), then `cache_manager.update(decision, x_before, x_after)`.
 - Begin step/branch:
   - Call `begin_step('cond')` before cond forward; `begin_step('uncond')` before uncond.
   - Manager increments `cnt` only on cond and tracks pair‑level stats.
 
 Compatibility and Priority
 - Priority: FBCache → TeaCache → Compute. Enable one at a time for predictability; if both are enabled, FBCache takes precedence by design.
-- Legacy attach: old per‑module TeaCache/FBCache states remain behind `--legacy_cache_compat` for transition; the Cache Manager is authoritative.
+- Legacy attach: per‑module TeaCache/FBCache states have been removed; CacheManager is authoritative across I2V/TI2V/S2V (non‑SP and SP).
 
 Limitations and Future Work
 - Policies: Only `linear` rescale is implemented; additional policies require calibration.
 - Mixed‑batch gating: Metrics are batch‑averaged; per‑sample gating would add complexity and is not enabled.
-- Subgroup collectives: Manager uses the default process group; subgroup support can be added if needed.
+- SP collectives: Reductions default to the global process group; explicit group wiring can be added if multiple groups coexist.
 - CUDA Graphs/compile: Orthogonal perf features; independent of caching but often complementary in steady‑state loops.
 
 

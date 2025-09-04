@@ -128,147 +128,7 @@ class WanTI2V:
         self._teacache_cfg = None  # type: ignore
         self._fbcache_cfg = None  # type: ignore
 
-    def _move_teacache_residual_to_cpu(self):
-        """If TeaCache is attached, move cached residuals to CPU to free VRAM.
-
-        Called when the model is offloaded to CPU; residuals are not parameters,
-        so `.to('cpu')` on the module does not move them automatically.
-        """
-        target = getattr(self.model, "module", self.model)
-        st = getattr(target, "teacache", None)
-        if not st:
-            return
-        for br in (st.cond, st.uncond):
-            if br.prev_residual is not None and br.prev_residual.device.type == 'cuda':
-                br.prev_residual = br.prev_residual.to('cpu')
-
-    def _attach_teacache_state(self, timesteps_len: int):
-        """Attach TeaCache state to the single DiT model (TI2V).
-
-        Args:
-            timesteps_len: Number of denoising steps for this run.
-        """
-        # Refresh config each run
-        self._teacache_cfg = dict(
-            enabled=getattr(self.config, "teacache", False),
-            num_steps=timesteps_len,
-            thresh=getattr(self.config, "teacache_thresh", 0.08),
-            policy=str(getattr(self.config, "teacache_policy", "linear")).lower(),
-            warmup=getattr(self.config, "teacache_warmup", 1),
-            last_steps=getattr(self.config, "teacache_last_steps", 1),
-            alternating=bool(getattr(self.config, "teacache_alternating", False)),
-        )
-        from .utils.teacache import reset as _teacache_reset
-        # Attach to model and inner module if FSDP-wrapped; reset per run
-        self.model.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-        if getattr(self.model, "teacache", None) is None:  # type: ignore[attr-defined]
-            self.model.teacache = TeaCacheState(  # type: ignore[attr-defined]
-                enabled=bool(self._teacache_cfg["enabled"]),
-                num_steps=int(self._teacache_cfg["num_steps"]),
-                thresh=float(self._teacache_cfg["thresh"]),
-                policy=str(self._teacache_cfg["policy"]),
-                warmup=int(self._teacache_cfg["warmup"]),
-                last_steps=int(self._teacache_cfg["last_steps"]),
-                sp_world_size=get_world_size(),
-            )
-        else:
-            st = getattr(self.model, "teacache")  # type: ignore[attr-defined]
-            st.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-            st.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
-            st.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
-            st.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
-            st.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
-            st.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
-            st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
-        _teacache_reset(getattr(self.model, "teacache"))  # type: ignore[arg-type]
-        # Module-level alternating switch to avoid expanding state schema
-        setattr(self.model, "alternating_teacache", bool(self._teacache_cfg["alternating"]))
-
-        inner = getattr(self.model, "module", None)
-        if inner is not None:
-            inner.enable_teacache = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-            if getattr(inner, "teacache", None) is None:  # type: ignore[attr-defined]
-                inner.teacache = TeaCacheState(  # type: ignore[attr-defined]
-                    enabled=bool(self._teacache_cfg["enabled"]),
-                    num_steps=int(self._teacache_cfg["num_steps"]),
-                    thresh=float(self._teacache_cfg["thresh"]),
-                    policy=str(self._teacache_cfg["policy"]),
-                    warmup=int(self._teacache_cfg["warmup"]),
-                    last_steps=int(self._teacache_cfg["last_steps"]),
-                    sp_world_size=get_world_size(),
-                )
-            else:
-                st_in = getattr(inner, "teacache")  # type: ignore[attr-defined]
-                st_in.enabled = bool(self._teacache_cfg["enabled"])  # type: ignore[attr-defined]
-                st_in.num_steps = int(self._teacache_cfg["num_steps"])  # type: ignore[attr-defined]
-                st_in.thresh = float(self._teacache_cfg["thresh"])  # type: ignore[attr-defined]
-                st_in.policy = str(self._teacache_cfg["policy"])  # type: ignore[attr-defined]
-                st_in.warmup = int(self._teacache_cfg["warmup"])  # type: ignore[attr-defined]
-                st_in.last_steps = int(self._teacache_cfg["last_steps"])  # type: ignore[attr-defined]
-                st_in.sp_world_size = get_world_size()  # type: ignore[attr-defined]
-            _teacache_reset(getattr(inner, "teacache"))  # type: ignore[arg-type]
-
-    def _attach_fbcache_state(self, timesteps_len: int):
-        """Attach FBCache to the single TI2V DiT model; reset per run.
-
-        No-op if disabled in config.
-        """
-        self._fbcache_cfg = dict(
-            enabled=getattr(self.config, "fbcache", False),
-            num_steps=timesteps_len,
-            thresh=getattr(self.config, "fb_thresh", 0.08),
-            metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")).lower(),
-            downsample=int(getattr(self.config, "fb_downsample", 1)),
-            ema=float(getattr(self.config, "fb_ema", 0.0)),
-            warmup=int(getattr(self.config, "fb_warmup", 1)),
-            last_steps=int(getattr(self.config, "fb_last_steps", 1)),
-            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", False)),
-        )
-        target = getattr(self.model, "module", self.model)
-        target.enable_fbcache = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
-        if getattr(target, "fbcache", None) is None:  # type: ignore[attr-defined]
-            target.fbcache = FBCacheState(  # type: ignore[attr-defined]
-                enabled=bool(self._fbcache_cfg["enabled"]),
-                num_steps=int(self._fbcache_cfg["num_steps"]),
-                thresh=float(self._fbcache_cfg["thresh"]),
-                metric=str(self._fbcache_cfg["metric"]),
-                downsample=int(self._fbcache_cfg["downsample"]),
-                ema=float(self._fbcache_cfg["ema"]),
-                warmup=int(self._fbcache_cfg["warmup"]),
-                last_steps=int(self._fbcache_cfg["last_steps"]),
-                cfg_sep_diff=bool(self._fbcache_cfg["cfg_sep_diff"]),
-                sp_world_size=get_world_size(),
-            )
-        else:
-            st = getattr(target, "fbcache")  # type: ignore[attr-defined]
-            st.enabled = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
-            st.num_steps = int(self._fbcache_cfg["num_steps"])  # type: ignore[attr-defined]
-            st.thresh = float(self._fbcache_cfg["thresh"])  # type: ignore[attr-defined]
-            st.metric = str(self._fbcache_cfg["metric"])  # type: ignore[attr-defined]
-            st.downsample = int(self._fbcache_cfg["downsample"])  # type: ignore[attr-defined]
-            st.ema = float(self._fbcache_cfg["ema"])  # type: ignore[attr-defined]
-            st.warmup = int(self._fbcache_cfg["warmup"])  # type: ignore[attr-defined]
-            st.last_steps = int(self._fbcache_cfg["last_steps"])  # type: ignore[attr-defined]
-            st.cfg_sep_diff = bool(self._fbcache_cfg["cfg_sep_diff"])  # type: ignore[attr-defined]
-            st.sp_world_size = get_world_size()  # type: ignore[attr-defined]
-        _fbcache_reset(getattr(target, "fbcache"))  # type: ignore[arg-type]
-
-    def _log_teacache_stats(self):
-        """Log end-of-run TeaCache telemetry (rank 0 only)."""
-        target = getattr(self.model, "module", self.model)
-        st = getattr(target, "teacache", None)
-        if not st or not getattr(target, "enable_teacache", False):
-            return
-        c = st.cond
-        u = st.uncond
-        def rate(sk, tot):
-            return (100.0 * sk / tot) if tot else 0.0
-        logging.info(
-            f"TeaCache skips: cond {c.skipped}/{c.total} ({rate(c.skipped,c.total):.1f}%), "
-            f"uncond {u.skipped}/{u.total} ({rate(u.skipped,u.total):.1f}%), "
-            f"avg rel {((c.sum_rel+u.sum_rel)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
-            f"avg rescaled {((c.sum_rescaled+u.sum_rescaled)/(c.count_rel+u.count_rel+1e-8)):.4f}, "
-            f"failsafe {st.failsafe_count}")
+    # Legacy TeaCache/FBCache helpers removed; use CacheManager only.
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -782,10 +642,7 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            # Attach legacy cache states only when compatibility flag is on.
-            if bool(getattr(self.config, "legacy_cache_compat", False)):
-                self._attach_teacache_state(len(timesteps))
-                self._attach_fbcache_state(len(timesteps))
+            # Legacy per-module cache states removed; using CacheManager only.
             mgr_cfg = CMConfig(
                 num_steps=int(len(timesteps)),
                 warmup=int(getattr(self.config, "teacache_warmup", 1)),
@@ -868,7 +725,10 @@ class WanTI2V:
         if dist.is_initialized():
             dist.barrier()
 
-        # Emit TeaCache telemetry on rank 0 (optional).
+        # Emit Cache Manager telemetry on rank 0 if enabled.
         if self.rank == 0:
-            self._log_teacache_stats()
+            tgt = getattr(self.model, "module", self.model)
+            mgr = getattr(tgt, "cache_manager", None)
+            if mgr is not None and (mgr.cfg.enable_fb or mgr.cfg.enable_tc):
+                logging.info(f"CacheManager summary: {mgr.summary()}")
         return videos[0] if self.rank == 0 else None

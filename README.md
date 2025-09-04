@@ -156,7 +156,7 @@ torchrun --nproc_per_node=8 generate.py \
 
 Examples & Flags:
 - TeaCache: `--teacache --teacache_thresh 0.08 [--teacache_policy linear --teacache_warmup 1 --teacache_last_steps 1 --teacache_alternating]`
-- FBCache: `--fbcache --fb_thresh 0.10 [--fb_metric hidden_rel_l1 --fb_downsample 1 --fb_ema 0 --fb_warmup 1 --fb_last_steps 1 --fb_cfg_sep_diff false]`
+- FBCache: `--fbcache --fb_thresh 0.10 [--fb_metric hidden_rel_l1 --fb_downsample 1 --fb_ema 0 --fb_warmup 1 --fb_last_steps 1 --fb_cfg_sep_diff true]`
 - CFG reuse: on by default in separate‑CFG pipelines; no flag required.
 - Combining: you can pass both, but FBCache takes precedence by design.
 
@@ -198,7 +198,7 @@ python generate.py --task s2v-14B \
 ```
 
 Compatibility:
-- Legacy cache attach (old Tea/FBCache state wiring): `--legacy_cache_compat` (default off). Prefer the unified Cache Manager.
+- Per‑module TeaCache/FBCache state wiring has been removed. The unified Cache Manager is authoritative across all pipelines and modes.
 
 ## Model Download https://github.com/Wan-Video/Wan2.2#model-download
 - Download official Wan2.2 weights from the upstream release and keep them locally.

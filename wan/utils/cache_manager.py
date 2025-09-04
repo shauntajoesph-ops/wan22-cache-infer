@@ -14,7 +14,7 @@ This module contains no training-time logic. All math is inference-only.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Literal, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import math
 import torch
@@ -50,6 +50,8 @@ class CMConfig:
     # Priority & distributed
     evaluation_order: Tuple[Mode, ...] = ("fb", "tc")
     sp_world_size: int = 1
+    # Optional explicit process group for SP reductions
+    sp_group: Optional[Any] = None
 
 
 @dataclass
@@ -173,8 +175,16 @@ class CacheManager:
             if not dist.is_initialized():
                 return value
             t = torch.tensor([value], dtype=torch.float32, device=device)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            ws = max(1, int(dist.get_world_size()))
+            try:
+                # Use explicit SP group if provided
+                group = getattr(self.cfg, "sp_group", None)
+                dist.all_reduce(t, op=dist.ReduceOp.SUM, group=group)
+                ws = dist.get_world_size(group=group) if group is not None else dist.get_world_size()
+            except Exception:
+                # Fallback to default group if group ops fail
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                ws = dist.get_world_size()
+            ws = max(1, int(ws))
             return float(t.item() / ws)
         except Exception:
             # Any reduction failure forces local compute downstream via failsafe
@@ -201,12 +211,38 @@ class CacheManager:
             if self.cfg.last_steps > 0 and self.cnt > max(0, self.cfg.num_steps - self.cfg.last_steps):
                 force_compute = True
 
-        # Uncond path under CFG cache: reuse cond decision/metric
+        # Uncond path under CFG cache: reuse cond decision/metric, but guard skip readiness
         if self.branch == "uncond" and not self.cfg.cfg_sep_diff and self._last_cond_decision is not None:
             d = self._last_cond_decision
             # Count per-branch total; skip increments are accounted in apply()
             br.total += 1
-            return Decision(action=d.action, mode=d.mode, resume_from_block=d.resume_from_block, reason="cfg_reuse", rel=d.rel, rel_rescaled=d.rel_rescaled)
+            # If cond decided to skip, ensure this branch has a valid residual before honoring it.
+            if d.action == "skip":
+                ready = (
+                    br.residual is not None
+                    and br.shape is not None
+                    and tuple(br.shape) == tuple(x.shape)
+                    and (br.dtype is None or br.dtype == x.dtype)
+                )
+                if not ready:
+                    # Divergence: uncond cannot follow cond skip; force compute and track.
+                    self.pair_divergence_failsafes += 1
+                    return Decision(
+                        action="compute",
+                        mode=d.mode,
+                        resume_from_block=d.resume_from_block,
+                        reason="cfg_residual_guard",
+                        rel=d.rel,
+                        rel_rescaled=d.rel_rescaled,
+                    )
+            return Decision(
+                action=d.action,
+                mode=d.mode,
+                resume_from_block=d.resume_from_block,
+                reason="cfg_reuse",
+                rel=d.rel,
+                rel_rescaled=d.rel_rescaled,
+            )
 
         last_decision: Optional[Decision] = None
 
@@ -238,10 +274,22 @@ class CacheManager:
                     br.tc_accum += float(rel_rescaled)
                 skip = (not force_compute) and (prev is not None) and (br.tc_accum < float(self.cfg.tc_thresh))
 
+                # Guard: ensure residual exists and matches shape/dtype before allowing skip
+                if skip:
+                    ready = (br.residual is not None and br.shape is not None and tuple(br.shape) == tuple(x.shape)
+                             and (br.dtype is None or br.dtype == x.dtype))
+                    if not ready:
+                        skip = False
+                        rel_reason = "residual_guard"
+                    else:
+                        rel_reason = "acc<tc_thresh"
+                else:
+                    rel_reason = "forced" if force_compute else "tc>=thresh"
+
                 # Update sig for next step
                 br.tc_prev_sig = float(cur_sig)
 
-                d = Decision(action=("skip" if skip else "compute"), mode="tc", resume_from_block=0, reason=("acc<tc_thresh" if skip else ("forced" if force_compute else "tc>=thresh")), rel=float(rel), rel_rescaled=float(rel_rescaled))
+                d = Decision(action=("skip" if skip else "compute"), mode="tc", resume_from_block=0, reason=rel_reason, rel=float(rel), rel_rescaled=float(rel_rescaled))
                 last_decision = d
                 if skip:
                     break
@@ -293,9 +341,20 @@ class CacheManager:
                     br.fb_accum += float(rel_rescaled)
                 skip = (not force_compute) and (prev is not None) and (br.fb_accum < float(self.cfg.fb_thresh))
 
+                if skip:
+                    ready = (br.residual is not None and br.shape is not None and tuple(br.shape) == tuple(x.shape)
+                             and (br.dtype is None or br.dtype == x.dtype))
+                    if not ready:
+                        skip = False
+                        fb_reason = "residual_guard"
+                    else:
+                        fb_reason = "acc<fb_thresh"
+                else:
+                    fb_reason = "forced" if force_compute else "fb>=thresh"
+
                 br.fb_prev_sig = float(cur_sig)
                 resume_from = 1 if metric.startswith("residual") and x_after_block0 is not None else 0
-                d = Decision(action=("skip" if skip else "compute"), mode="fb", resume_from_block=resume_from, reason=("acc<fb_thresh" if skip else ("forced" if force_compute else "fb>=thresh")), rel=float(rel), rel_rescaled=float(rel_rescaled))
+                d = Decision(action=("skip" if skip else "compute"), mode="fb", resume_from_block=resume_from, reason=fb_reason, rel=float(rel), rel_rescaled=float(rel_rescaled))
                 last_decision = d
                 if skip:
                     break
@@ -332,10 +391,10 @@ class CacheManager:
         return d
 
     # ---------- Application & Update ----------
-    def apply(self, decision: Decision, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    def apply(self, decision: Decision, x: torch.Tensor) -> Tuple[torch.Tensor, int, bool]:
         br = self._br()
         if decision.action != "skip":
-            return x, decision.resume_from_block
+            return x, decision.resume_from_block, False
 
         # Guard: residual existence, shape, and dtype match
         if (
@@ -348,12 +407,13 @@ class CacheManager:
             if self.branch == "uncond":
                 self.pair_divergence_failsafes += 1
             self.failsafe_count += 1
-            return x, decision.resume_from_block
+            # Signal to caller that skip was not applied so it can fall back to compute
+            return x, decision.resume_from_block, False
 
         res = br.residual.to(device=x.device, dtype=x.dtype)
         x_out = x + res
         br.skipped += 1
-        return x_out, decision.resume_from_block
+        return x_out, decision.resume_from_block, True
 
     def update(self, decision: Decision, x_before: torch.Tensor, x_after: torch.Tensor) -> None:
         br = self._br()

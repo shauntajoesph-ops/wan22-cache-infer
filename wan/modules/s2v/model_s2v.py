@@ -30,6 +30,7 @@ from ..model import (
 from .audio_utils import AudioInjector_WAN, CausalAudioEncoder
 from .motioner import FramePackMotioner, MotionerTransformers
 from .s2v_utils import rope_precompute
+from ...utils.cache_runner import run_with_cache_manager
 
 
 def zero_module(module):
@@ -342,11 +343,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
 
         self.use_context_parallel = False  # will modify in _configure_model func
 
-        # TeaCache integration (Phase 2 for S2V):
-        # - Disabled by default; the S2V pipeline attaches a TeaCacheState when enabled.
-        # - Kept generic to mirror Phase 1 behavior (I2V/TI2V) for consistency.
-        self.enable_teacache = False  # type: ignore[attr-defined]
-        self.teacache = None  # type: ignore[attr-defined]
+        # Legacy per-module TeaCache/FBCache state removed; use CacheManager instead.
 
         if cond_dim > 0:
             self.cond_encoder = nn.Conv3d(
@@ -853,44 +850,34 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
         from ...utils.cache_manager import CacheManager
         cache_mgr = getattr(self, "cache_manager", None)
 
-        if cache_mgr is None or (not cache_mgr.cfg.enable_fb and not cache_mgr.cfg.enable_tc):
-            for idx, block in enumerate(self.blocks):
-                x = block(x, **kwargs)
-                x = self.after_transformer_block(idx, x)
-        else:
-            # Build segmented modulated input to align with S2V modulation semantics
-            block0 = self.blocks[0]
-            norm_x = block0.norm1(x).float()
-            e_tensor, seg_val = e0  # e_tensor: [B,6,2,C]
+        def _build_mod_inp(m: "WanModel_S2V", x_in: torch.Tensor, kw: dict) -> torch.Tensor:
+            block0 = m.blocks[0]
+            norm_x = block0.norm1(x_in).float()
+            e_tensor, seg_val = kw["e"]  # [B,6,2,C], seg index
             modulation = block0.modulation.unsqueeze(2)
             with amp.autocast(dtype=torch.float32):
                 e_chunks = (modulation + e_tensor).chunk(6, dim=1)
             e_chunks = [u.squeeze(1) for u in e_chunks]
-            seg_idx = int(max(0, min(int(seg_val), x.size(1))))
+            seg_idx = int(max(0, min(int(seg_val), x_in.size(1))))
             seg0 = norm_x[:, :seg_idx] * (1 + e_chunks[1][:, 0:1]) + e_chunks[0][:, 0:1]
             seg1 = norm_x[:, seg_idx:] * (1 + e_chunks[1][:, 1:2]) + e_chunks[0][:, 1:2]
-            mod_inp = torch.cat([seg0, seg1], dim=1)
+            return torch.cat([seg0, seg1], dim=1)
 
-            x_after_block0 = None
-            if cache_mgr.cfg.enable_fb and str(cache_mgr.cfg.fb_metric).startswith("residual"):
-                x_after_block0 = self.blocks[0](x, **kwargs)
-                x_after_block0 = self.after_transformer_block(0, x_after_block0)
+        def _build_block0_residual(m: "WanModel_S2V", x_in: torch.Tensor, kw: dict) -> torch.Tensor:
+            xb0 = m.blocks[0](x_in, **kw)
+            return m.after_transformer_block(0, xb0)
 
-            decision = cache_mgr.decide(x=x, mod_inp=mod_inp, x_after_block0=x_after_block0)
-            x_before = x
-            x, resume_from = cache_mgr.apply(decision, x)
+        def _per_block_post(m: "WanModel_S2V", idx: int, x_blk: torch.Tensor, kw: dict) -> torch.Tensor:
+            return m.after_transformer_block(idx, x_blk)
 
-            if decision.action == "compute":
-                if resume_from <= 0:
-                    for idx, block in enumerate(self.blocks):
-                        x = block(x, **kwargs)
-                        x = self.after_transformer_block(idx, x)
-                else:
-                    x = x_after_block0 if x_after_block0 is not None else self.after_transformer_block(0, self.blocks[0](x, **kwargs))
-                    for idx, block in enumerate(self.blocks[1:], start=1):
-                        x = block(x, **kwargs)
-                        x = self.after_transformer_block(idx, x)
-                cache_mgr.update(decision, x_before=x_before, x_after=x)
+        x = run_with_cache_manager(
+            model=self,
+            x=x,
+            kwargs=kwargs,
+            build_mod_inp=_build_mod_inp,
+            build_block0_residual=_build_block0_residual,
+            per_block_post=_per_block_post,
+        )
 
         # Context Parallel
         if self.use_context_parallel:

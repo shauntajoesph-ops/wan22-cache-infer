@@ -32,8 +32,8 @@ if [ -d "$TI2V_DIR" ]; then
     --t5_cpu \
     --teacache --teacache_thresh 0.08 \
     --save_file "$LOGDIR/ti2v_teacache.mp4" | tee "$LOG_TTI"
-  if grep -q "TeaCache skips:" "$LOG_TTI"; then
-    echo "[OK] TI2V TeaCache telemetry present."
+  if grep -E -q "TeaCache skips:|CacheManager" "$LOG_TTI"; then
+    echo "[OK] TI2V cache telemetry present."
   else
     echo "[WARN] TI2V telemetry not found; generation may still have succeeded."
   fi
@@ -54,8 +54,8 @@ if [ -d "$I2V_DIR" ]; then
     --t5_cpu \
     --teacache --teacache_thresh 0.08 \
     --save_file "$LOGDIR/i2v_teacache.mp4" | tee "$LOG_I2V"
-  if grep -q "TeaCache\[" "$LOG_I2V"; then
-    echo "[OK] I2V TeaCache telemetry present."
+  if grep -E -q "TeaCache\[|CacheManager" "$LOG_I2V"; then
+    echo "[OK] I2V cache telemetry present."
   else
     echo "[WARN] I2V telemetry not found; generation may still have succeeded."
   fi
@@ -84,4 +84,3 @@ else
 fi
 
 echo "[TeaCache Test] Done. Logs in $LOGDIR"
-

@@ -36,6 +36,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.graphs import CUDAGraphRunner
 from .utils.fbcache import FBCacheState, reset as _fbcache_reset
 from .utils.cache_manager import CacheManager, CMConfig
 
@@ -94,6 +95,8 @@ class WanS2V:
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self._dit_fsdp = dit_fsdp
+        self._use_sp = use_sp
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -200,6 +203,16 @@ class WanS2V:
             if not self.init_on_cpu:
                 model.to(self.device)
 
+        # Optional: torch.compile for local (non-FSDP) models
+        try:
+            compile_mode = str(getattr(self.config, "compile_mode", "none")).lower()
+            if compile_mode != "none" and not dit_fsdp:
+                import torch
+                model = torch.compile(model, mode=compile_mode)
+                logging.info(f"Applied torch.compile(mode={compile_mode}) to S2V model")
+        except Exception as e:  # pragma: no cover
+            logging.warning(f"torch.compile failed or unavailable: {e}")
+
         return model
 
     def _attach_teacache_state(self, timesteps_len: int):
@@ -278,7 +291,7 @@ class WanS2V:
             ema=float(getattr(self.config, "fb_ema", 0.0)),
             warmup=int(getattr(self.config, "fb_warmup", 1)),
             last_steps=int(getattr(self.config, "fb_last_steps", 1)),
-            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", True)),
+            cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", False)),
         )
         target = self.noise_model
         target.enable_fbcache = bool(self._fbcache_cfg["enabled"])  # type: ignore[attr-defined]
@@ -749,7 +762,7 @@ class WanS2V:
                     fb_metric=str(getattr(self.config, "fb_metric", "hidden_rel_l1")),
                     fb_downsample=int(getattr(self.config, "fb_downsample", 1)),
                     fb_ema=float(getattr(self.config, "fb_ema", 0.0)),
-                    cfg_sep_diff=False,
+                    cfg_sep_diff=bool(getattr(self.config, "fb_cfg_sep_diff", False)),
                     evaluation_order=("fb", "tc"),
                     sp_world_size=self.sp_size,
                 )
@@ -792,6 +805,13 @@ class WanS2V:
                     self.noise_model.to(self.device)
                     torch.cuda.empty_cache()
 
+                # Optional CUDA Graphs (single-GPU, no FSDP/SP, no offload)
+                graphs_ok = bool(getattr(self.config, "cuda_graphs", False)) and (self.sp_size == 1) and (not self._dit_fsdp) and (not offload_model)
+                tgt = getattr(self.noise_model, "module", self.noise_model)
+                if graphs_ok:
+                    setattr(tgt, "_cg_cond", getattr(tgt, "_cg_cond", None))
+                    setattr(tgt, "_cg_uncond", getattr(tgt, "_cg_uncond", None))
+
                 for i, t in enumerate(tqdm(timesteps)):
                     latent_model_input = latents[0:1]
                     timestep = [t]
@@ -803,15 +823,45 @@ class WanS2V:
                     if mgr is not None:
                         mgr.begin_step("cond")
 
-                    noise_pred_cond = self.noise_model(
-                        latent_model_input, t=timestep, **arg_c)
+                    # Cond forward (optionally via CUDA Graphs)
+                    if graphs_ok and getattr(tgt, "_cg_cond", None) is not None:
+                        runner: CUDAGraphRunner = getattr(tgt, "_cg_cond")
+                        noise_pred_cond = runner.replay(latent_model_input[0], timestep)
+                    elif graphs_ok and getattr(tgt, "_cg_cond", None) is None:
+                        try:
+                            fn = lambda l, ts: self.noise_model([l], t=ts, **arg_c)
+                            runner = CUDAGraphRunner(fn=fn, example_latent=latent_model_input[0], example_timestep=timestep)
+                            setattr(tgt, "_cg_cond", runner)
+                            noise_pred_cond = runner.replay(latent_model_input[0], timestep)
+                            logging.info("CUDA Graphs capture initialized for S2V cond branch")
+                        except Exception as e:
+                            logging.warning(f"CUDA Graphs capture (S2V cond) failed; falling back: {e}")
+                            graphs_ok = False
+                            noise_pred_cond = self.noise_model(latent_model_input, t=timestep, **arg_c)
+                    else:
+                        noise_pred_cond = self.noise_model(latent_model_input, t=timestep, **arg_c)
 
                     if guide_scale > 1:
                         # (CFG Cache) Branch=uncond
                         if mgr is not None:
                             mgr.begin_step("uncond")
-                        noise_pred_uncond = self.noise_model(
-                            latent_model_input, t=timestep, **arg_null)
+                        # Uncond forward (optionally via CUDA Graphs)
+                        if graphs_ok and getattr(tgt, "_cg_uncond", None) is not None:
+                            runner_u: CUDAGraphRunner = getattr(tgt, "_cg_uncond")
+                            noise_pred_uncond = runner_u.replay(latent_model_input[0], timestep)
+                        elif graphs_ok and getattr(tgt, "_cg_uncond", None) is None:
+                            try:
+                                fn_u = lambda l, ts: self.noise_model([l], t=ts, **arg_null)
+                                runner_u = CUDAGraphRunner(fn=fn_u, example_latent=latent_model_input[0], example_timestep=timestep)
+                                setattr(tgt, "_cg_uncond", runner_u)
+                                noise_pred_uncond = runner_u.replay(latent_model_input[0], timestep)
+                                logging.info("CUDA Graphs capture initialized for S2V uncond branch")
+                            except Exception as e:
+                                logging.warning(f"CUDA Graphs capture (S2V uncond) failed; falling back: {e}")
+                                graphs_ok = False
+                                noise_pred_uncond = self.noise_model(latent_model_input, t=timestep, **arg_null)
+                        else:
+                            noise_pred_uncond = self.noise_model(latent_model_input, t=timestep, **arg_null)
                         noise_pred = [
                             u + guide_scale * (c - u)
                             for c, u in zip(noise_pred_cond, noise_pred_uncond)
@@ -866,4 +916,8 @@ class WanS2V:
         if dist.is_initialized():
             dist.barrier()
 
+        if self.rank == 0:
+            logging.info(
+                f"Run perf config: compile_mode={getattr(self.config, 'compile_mode', 'none')}, cuda_graphs={getattr(self.config, 'cuda_graphs', False)}"
+            )
         return videos[0] if self.rank == 0 else None
